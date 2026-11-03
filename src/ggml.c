@@ -1250,9 +1250,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "LOG2",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -2944,6 +2945,11 @@ struct ggml_tensor * ggml_exp(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
     return ggml_unary(ctx, a, GGML_UNARY_OP_EXP);
+}
+
+struct ggml_tensor * ggml_log2(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    return ggml_unary(ctx, a, GGML_UNARY_OP_LOG2);
 }
 
 struct ggml_tensor * ggml_exp_inplace(
@@ -7282,6 +7288,12 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_EXP: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
+                    }
+                } break;
+                case GGML_UNARY_OP_LOG2: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                                ggml_scale(ctx, ggml_div(ctx, grad, src0), 1.4426950408889634f));
                     }
                 } break;
                 case GGML_UNARY_OP_EXPM1: {

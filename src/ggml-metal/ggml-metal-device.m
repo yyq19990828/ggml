@@ -1569,6 +1569,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_LOG2:
+                    return op->src[0] != NULL && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(op->src[0], op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                        ggml_nelements(op) <= INT32_MAX;
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
@@ -1856,7 +1860,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->type == GGML_TYPE_F32 && op->src[0] && op->src[1] && op->src[2] &&
                 op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
                 ggml_are_same_shape(op->src[0], op) && ggml_can_repeat(op->src[1], op) && ggml_can_repeat(op->src[2], op) &&
-                ggml_is_contiguous(op);
+                ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX;
 
         case GGML_OP_MUL_MAT:
             if (ggml_mul_mat_get_reduction_policy(op) != GGML_MUL_MAT_REDUCTION_DEFAULT) {

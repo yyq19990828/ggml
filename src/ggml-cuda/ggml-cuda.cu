@@ -2441,6 +2441,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_EXP:
                     ggml_cuda_op_exp(ctx, dst);
                     break;
+                case GGML_UNARY_OP_LOG2:
+                    ggml_cuda_op_log2(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_ELU:
                     ggml_cuda_op_elu(ctx, dst);
                     break;
@@ -6443,6 +6446,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_is_contiguous(op);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_LOG2:
+                    return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(op->src[0], op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                        ggml_nelements(op) <= (int64_t) std::numeric_limits<int>::max() * CUDA_NEG_BLOCK_SIZE;
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:

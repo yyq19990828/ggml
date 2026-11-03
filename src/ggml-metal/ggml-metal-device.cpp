@@ -249,6 +249,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary(ggml_metal
         case GGML_OP_LEAKY_RELU: op_num = OP_UNARY_NUM_LEAKY_RELU; break;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_LOG2:       op_num = OP_UNARY_NUM_LOG2;       break;
                 case GGML_UNARY_OP_TANH:        op_num = OP_UNARY_NUM_TANH;        break;
                 case GGML_UNARY_OP_RELU:        op_num = OP_UNARY_NUM_RELU;        break;
                 case GGML_UNARY_OP_SIGMOID:     op_num = OP_UNARY_NUM_SIGMOID;     break;

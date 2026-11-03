@@ -75,6 +75,10 @@ static inline float op_log(float x) {
     return logf(x);
 }
 
+static inline float op_log2(float x) {
+    return log2f(x);
+}
+
 static inline float op_expm1(float x) {
     return expf(x) - 1.0f;
 }
@@ -316,6 +320,12 @@ void ggml_compute_forward_pow_base_f32(const ggml_compute_params * params, ggml_
 
 void ggml_compute_forward_log(const ggml_compute_params * params, ggml_tensor * dst) {
     unary_op<op_log>(params, dst);
+}
+
+void ggml_compute_forward_log2(const ggml_compute_params * params, ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst->src[0]) && ggml_is_contiguous(dst));
+    unary_op<op_log2>(params, dst);
 }
 
 void ggml_compute_forward_expm1(const ggml_compute_params * params, ggml_tensor * dst) {

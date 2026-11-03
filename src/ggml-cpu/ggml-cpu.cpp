@@ -446,6 +446,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(op) == GGML_UNARY_OP_LOG2) {
+                return src0 != nullptr && src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(src0, op) && ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+            }
+            return true;
         case GGML_OP_POW_BASE_F32: {
             const float base = ggml_get_op_params_f32(op, 0);
             return src0 != nullptr &&

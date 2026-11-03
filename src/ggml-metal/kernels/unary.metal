@@ -79,6 +79,10 @@ kernel void kernel_unary_impl(
             dst_ptr[i0] = (T) log(x);
         }
 
+        if (FC_OP == OP_UNARY_NUM_LOG2) {
+            dst_ptr[i0] = (T) precise::log2(x);
+        }
+
         if (FC_OP == OP_UNARY_NUM_LEAKY_RELU) {
             dst_ptr[i0] = (T) (TC(x > 0)*x + TC(x <= 0)*(x * args.slope));
         }

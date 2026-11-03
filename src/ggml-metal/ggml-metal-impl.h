@@ -151,6 +151,7 @@
 #define OP_UNARY_NUM_SIN        15
 #define OP_UNARY_NUM_COS        16
 #define OP_UNARY_NUM_LOG        17
+#define OP_UNARY_NUM_LOG2       122
 #define OP_UNARY_NUM_LEAKY_RELU 18
 
 #define OP_UNARY_NUM_TANH        100

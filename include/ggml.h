@@ -637,6 +637,7 @@ extern "C" {
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
 
+        GGML_UNARY_OP_LOG2,
         GGML_UNARY_OP_COUNT,
     };
 
@@ -1042,6 +1043,12 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_log_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // Dense contiguous F32 native base-two logarithm.
+#define GGML_LOG2_VERSION 1
+    GGML_API struct ggml_tensor * ggml_log2(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
