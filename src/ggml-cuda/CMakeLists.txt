@@ -280,6 +280,7 @@ if (CUDAToolkit_FOUND)
          "${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/softmax-wide-order.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/log-f32-precise.cu"
@@ -292,6 +293,8 @@ if (CUDAToolkit_FOUND)
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-wide-order.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
