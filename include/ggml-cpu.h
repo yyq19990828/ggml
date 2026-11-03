@@ -7,6 +7,19 @@
 extern "C" {
 #endif
 
+
+    // SAM diagnostic extension. Install/remove only while all CPU graphs are idle.
+    // The callback borrows actual scratch at a synchronized kernel boundary;
+    // it must not throw, reenter GGML, or retain the pointer after returning.
+    typedef void (*ggml_cpu_sam_observer)(const struct ggml_tensor * dst,
+        const char * phase, const char * path, enum ggml_type rhs_type,
+        const void * scratch, size_t scratch_bytes, int64_t wall_us, void * user);
+    GGML_BACKEND_API void ggml_cpu_sam_set_observer(ggml_cpu_sam_observer callback, void * user);
+    GGML_BACKEND_API bool ggml_cpu_sam_observer_enabled(void);
+    GGML_BACKEND_API void ggml_cpu_sam_observe(const struct ggml_tensor * dst,
+        const char * phase, const char * path, enum ggml_type rhs_type,
+        const void * scratch, size_t scratch_bytes, int64_t wall_us);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {

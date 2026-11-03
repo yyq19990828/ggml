@@ -1161,6 +1161,31 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+
+// Opt-in process-local diagnostics. The idle-only installation contract keeps
+// callback/user coherent; atomics provide a cheap normal-path enabled check.
+static ggml_cpu_sam_observer sam_observer_callback = NULL;
+static void * sam_observer_user = NULL;
+static atomic_bool sam_observer_active = false;
+
+void ggml_cpu_sam_set_observer(ggml_cpu_sam_observer callback, void * user) {
+    atomic_store_explicit(&sam_observer_active, false, memory_order_release);
+    sam_observer_user = user;
+    sam_observer_callback = callback;
+    atomic_store_explicit(&sam_observer_active, callback != NULL, memory_order_release);
+}
+
+bool ggml_cpu_sam_observer_enabled(void) {
+    return atomic_load_explicit(&sam_observer_active, memory_order_acquire);
+}
+
+void ggml_cpu_sam_observe(const struct ggml_tensor * dst,
+        const char * phase, const char * path, enum ggml_type rhs_type,
+        const void * scratch, size_t scratch_bytes, int64_t wall_us) {
+    if (ggml_cpu_sam_observer_enabled())
+        sam_observer_callback(dst, phase, path, rhs_type, scratch, scratch_bytes, wall_us, sam_observer_user);
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1326,6 +1351,10 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
+    const bool sam_capture = ggml_cpu_sam_observer_enabled() &&
+        ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+    const int64_t sam_pack_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1383,6 +1412,15 @@ UseGgmlGemm1:;
     }
 
     ggml_barrier(params->threadpool);
+
+    if (sam_capture) {
+        if (ith == 0) ggml_cpu_sam_observe(dst, "packing", "dot", vec_dot_type,
+            params->wdata, ggml_row_size(vec_dot_type, ggml_nelements(src1)), ggml_time_us() - sam_pack_start);
+        // Exclude the scratch-copy callback from the arithmetic interval.
+        ggml_barrier(params->threadpool);
+    }
+    const int64_t sam_arithmetic_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
     if (!params->use_ref && src1->type != vec_dot_type) {
@@ -1470,6 +1508,12 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+    if (sam_capture) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) ggml_cpu_sam_observe(dst, "arithmetic", "dot", vec_dot_type,
+            NULL, 0, ggml_time_us() - sam_arithmetic_start);
+    }
+
 }
 
 // ggml_compute_forward_mul_mat_id
