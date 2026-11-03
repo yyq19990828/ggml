@@ -40,6 +40,10 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cublasLt.h>
+#endif
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -1443,6 +1447,94 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct ggml_cuda_lt_matmul_cache_entry {
+    int m = 0;
+    int n = 0;
+    int k = 0;
+    uint32_t alignment_a = 0;
+    uint32_t alignment_b = 0;
+    uint32_t alignment_c = 0;
+    uint32_t alignment_d = 0;
+    uint32_t alignment_bias = 0;
+    bool supported = false;
+    uint64_t last_used = 0;
+    size_t workspace_bytes = 0;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t layout_a = nullptr;
+    cublasLtMatrixLayout_t layout_b = nullptr;
+    cublasLtMatrixLayout_t layout_c = nullptr;
+    cublasLtMatrixLayout_t layout_d = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    uint64_t numerical_flags = 0;
+
+    ggml_cuda_lt_matmul_cache_entry() = default;
+    ggml_cuda_lt_matmul_cache_entry(const ggml_cuda_lt_matmul_cache_entry &) = delete;
+    ggml_cuda_lt_matmul_cache_entry & operator=(const ggml_cuda_lt_matmul_cache_entry &) = delete;
+
+    ggml_cuda_lt_matmul_cache_entry(ggml_cuda_lt_matmul_cache_entry && other) noexcept {
+        *this = std::move(other);
+    }
+
+    ggml_cuda_lt_matmul_cache_entry & operator=(ggml_cuda_lt_matmul_cache_entry && other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        reset();
+        m = other.m;
+        n = other.n;
+        k = other.k;
+        alignment_a = other.alignment_a;
+        alignment_b = other.alignment_b;
+        alignment_c = other.alignment_c;
+        alignment_d = other.alignment_d;
+        alignment_bias = other.alignment_bias;
+        supported = other.supported;
+        last_used = other.last_used;
+        workspace_bytes = other.workspace_bytes;
+        operation = std::exchange(other.operation, nullptr);
+        layout_a = std::exchange(other.layout_a, nullptr);
+        layout_b = std::exchange(other.layout_b, nullptr);
+        layout_c = std::exchange(other.layout_c, nullptr);
+        layout_d = std::exchange(other.layout_d, nullptr);
+        preference = std::exchange(other.preference, nullptr);
+        algo = other.algo;
+        numerical_flags = other.numerical_flags;
+        return *this;
+    }
+
+    ~ggml_cuda_lt_matmul_cache_entry() {
+        reset();
+    }
+
+    void reset() {
+        if (preference != nullptr) CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
+        if (layout_d != nullptr) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(layout_d));
+        if (layout_c != nullptr) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(layout_c));
+        if (layout_b != nullptr) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(layout_b));
+        if (layout_a != nullptr) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(layout_a));
+        if (operation != nullptr) CUBLAS_CHECK(cublasLtMatmulDescDestroy(operation));
+        preference = nullptr;
+        layout_d = nullptr;
+        layout_c = nullptr;
+        layout_b = nullptr;
+        layout_a = nullptr;
+        operation = nullptr;
+        supported = false;
+    }
+};
+
+struct ggml_cuda_lt_stream_resources {
+    cublasLtHandle_t handle = nullptr;
+    void * workspace = nullptr;
+    size_t workspace_bytes = 0;
+    uint64_t use_clock = 0;
+    std::vector<ggml_cuda_lt_matmul_cache_entry> algorithms;
+    std::mutex mutex;
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1452,6 +1544,10 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_lt_stream_resources cublaslt[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+#endif
 
     int curr_stream_no = 0;
 

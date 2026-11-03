@@ -694,15 +694,53 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void ggml_cuda_lt_release_entry(ggml_cuda_lt_matmul_cache_entry & entry) {
+    entry.reset();
+}
+#endif
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_set_device(device);
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (streams[i][j] != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+            }
+        }
+    }
+#ifdef USE_CUDA_GRAPH
+    // Graph executables can retain pointers to the per-stream Lt workspaces.
+    // Destroy them only after captured work has completed and before freeing
+    // those workspaces.
+    cuda_graphs.clear();
+#endif
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_lt_stream_resources & lt = cublaslt[i][j];
+            for (ggml_cuda_lt_matmul_cache_entry & entry : lt.algorithms) {
+                ggml_cuda_lt_release_entry(entry);
+            }
+            lt.algorithms.clear();
+            if (lt.handle != nullptr) {
+                CUBLAS_CHECK(cublasLtDestroy(lt.handle));
+                lt.handle = nullptr;
+            }
+            if (lt.workspace != nullptr) {
+                CUDA_CHECK(cudaFree(lt.workspace));
+                lt.workspace = nullptr;
+            }
+#endif
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
@@ -3540,6 +3578,332 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+namespace {
+
+constexpr size_t GGML_CUDA_LT_MAX_WORKSPACE_BYTES = 1024 * 1024;
+constexpr size_t GGML_CUDA_LT_MAX_CACHED_ALGORITHMS = 32;
+constexpr uint32_t GGML_CUDA_LT_MAX_ALIGNMENT_BYTES = 256;
+
+static uint32_t ggml_cuda_lt_pointer_alignment(const void * pointer) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+    if (address == 0) {
+        return 0;
+    }
+    const uintptr_t least_significant_bit = address & (~address + 1);
+    return static_cast<uint32_t>(std::min<uintptr_t>(least_significant_bit, GGML_CUDA_LT_MAX_ALIGNMENT_BYTES));
+}
+
+static bool ggml_cuda_lt_tensor_range(const ggml_tensor * tensor, uintptr_t * begin, uintptr_t * end) {
+    if (tensor == nullptr || tensor->data == nullptr || tensor->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    size_t bytes = sizeof(float);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] <= 0 || static_cast<uint64_t>(tensor->ne[i]) >
+                std::numeric_limits<size_t>::max() / bytes) {
+            return false;
+        }
+        bytes *= static_cast<size_t>(tensor->ne[i]);
+    }
+    const uintptr_t address = reinterpret_cast<uintptr_t>(tensor->data);
+    if (bytes > std::numeric_limits<uintptr_t>::max() - address) {
+        return false;
+    }
+    *begin = address;
+    *end = address + bytes;
+    return true;
+}
+
+static bool ggml_cuda_lt_ranges_disjoint(const ggml_tensor * output, const ggml_tensor * input) {
+    uintptr_t output_begin = 0;
+    uintptr_t output_end = 0;
+    uintptr_t input_begin = 0;
+    uintptr_t input_end = 0;
+    if (!ggml_cuda_lt_tensor_range(output, &output_begin, &output_end) ||
+            !ggml_cuda_lt_tensor_range(input, &input_begin, &input_end)) {
+        return false;
+    }
+    return output_end <= input_begin || input_end <= output_begin;
+}
+
+static bool ggml_cuda_lt_cache_key_matches(const ggml_cuda_lt_matmul_cache_entry & entry,
+        int m, int n, int k, uint32_t alignment_a, uint32_t alignment_b,
+        uint32_t alignment_c, uint32_t alignment_d, uint32_t alignment_bias) {
+    return entry.m == m && entry.n == n && entry.k == k &&
+        entry.alignment_a == alignment_a && entry.alignment_b == alignment_b &&
+        entry.alignment_c == alignment_c && entry.alignment_d == alignment_d &&
+        entry.alignment_bias == alignment_bias;
+}
+
+static bool ggml_cuda_lt_optional_status(cublasStatus_t status) {
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
+        return false;
+    }
+    CUBLAS_CHECK(status);
+    return true;
+}
+
+static bool ggml_cuda_lt_initialize_entry(ggml_cuda_lt_stream_resources & stream_resources,
+        ggml_cuda_lt_matmul_cache_entry & entry, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * bias, const ggml_tensor * output, int m, int n, int k) {
+    if (!ggml_cuda_lt_optional_status(cublasLtMatmulDescCreate(
+                &entry.operation, CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F)) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatrixLayoutCreate(
+                &entry.layout_a, CUDA_R_32F, k, m, k)) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatrixLayoutCreate(
+                &entry.layout_b, CUDA_R_32F, k, n, k)) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatrixLayoutCreate(
+                &entry.layout_c, CUDA_R_32F, m, n, m)) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatrixLayoutCreate(
+                &entry.layout_d, CUDA_R_32F, m, n, m)) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulPreferenceCreate(&entry.preference))) {
+        return false;
+    }
+
+    const cublasOperation_t transpose_a = CUBLAS_OP_T;
+    const cublasOperation_t transpose_b = CUBLAS_OP_N;
+    const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+    const cudaDataType_t bias_type = CUDA_R_32F;
+    const void * bias_pointer = bias->data;
+    const uint64_t max_workspace_bytes = GGML_CUDA_LT_MAX_WORKSPACE_BYTES;
+    if (!ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(entry.operation,
+                CUBLASLT_MATMUL_DESC_TRANSA, &transpose_a, sizeof(transpose_a))) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(entry.operation,
+                CUBLASLT_MATMUL_DESC_TRANSB, &transpose_b, sizeof(transpose_b))) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(entry.operation,
+                CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue))) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(entry.operation,
+                CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type))) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(entry.operation,
+                CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer, sizeof(bias_pointer))) ||
+            !ggml_cuda_lt_optional_status(cublasLtMatmulPreferenceSetAttribute(entry.preference,
+                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace_bytes, sizeof(max_workspace_bytes)))) {
+        return false;
+    }
+
+    const std::array<std::pair<cublasLtMatmulPreferenceAttributes_t, uint32_t>, 4> alignments = {{
+        { CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, entry.alignment_a },
+        { CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, entry.alignment_b },
+        { CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, entry.alignment_c },
+        { CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, entry.alignment_d },
+    }};
+    for (const auto & [attribute, alignment] : alignments) {
+        if (!ggml_cuda_lt_optional_status(cublasLtMatmulPreferenceSetAttribute(
+                    entry.preference, attribute, &alignment, sizeof(alignment)))) {
+            return false;
+        }
+    }
+
+    std::array<cublasLtMatmulHeuristicResult_t, 16> results{};
+    int returned_results = 0;
+    const cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(stream_resources.handle,
+            entry.operation, entry.layout_a, entry.layout_b, entry.layout_c, entry.layout_d,
+            entry.preference, static_cast<int>(results.size()), results.data(), &returned_results);
+    if (!ggml_cuda_lt_optional_status(heuristic_status)) {
+        return false;
+    }
+
+    const uintptr_t address_a = reinterpret_cast<uintptr_t>(src0->data);
+    const uintptr_t address_b = reinterpret_cast<uintptr_t>(src1->data);
+    const uintptr_t address_c = reinterpret_cast<uintptr_t>(output->data);
+    const std::array<std::pair<cublasLtMatmulAlgoCapAttributes_t, std::pair<uintptr_t, uint32_t>>, 4> caps = {{
+        { CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_A_BYTES, { address_a, entry.alignment_a } },
+        { CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_B_BYTES, { address_b, entry.alignment_b } },
+        { CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_C_BYTES, { address_c, entry.alignment_c } },
+        { CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_D_BYTES, { address_c, entry.alignment_d } },
+    }};
+
+    for (int i = 0; i < returned_results; ++i) {
+        const cublasLtMatmulHeuristicResult_t & result = results[i];
+        if (result.state != CUBLAS_STATUS_SUCCESS || result.workspaceSize > GGML_CUDA_LT_MAX_WORKSPACE_BYTES) {
+            continue;
+        }
+
+        uint64_t numerical_flags = 0;
+        cublasStatus_t status = cublasLtMatmulAlgoCapGetAttribute(&result.algo,
+                CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS, &numerical_flags, sizeof(numerical_flags), nullptr);
+        if (!ggml_cuda_lt_optional_status(status)) {
+            continue;
+        }
+        if ((numerical_flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_OP_INPUT_TYPE_MASK) !=
+                    CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_32F ||
+                (numerical_flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_TYPE_MASK) !=
+                    CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32F ||
+                (numerical_flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_OP_TYPE_MASK) !=
+                    CUBLASLT_NUMERICAL_IMPL_FLAGS_FMA) {
+            continue;
+        }
+#ifdef CUBLASLT_NUMERICAL_IMPL_FLAGS_GAUSSIAN
+        if ((numerical_flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_GAUSSIAN) != 0) {
+            continue;
+        }
+#endif
+
+        bool alignment_supported = true;
+        for (const auto & [attribute, pointer] : caps) {
+            uint32_t required_alignment = 0;
+            status = cublasLtMatmulAlgoCapGetAttribute(&result.algo, attribute,
+                    &required_alignment, sizeof(required_alignment), nullptr);
+            if (!ggml_cuda_lt_optional_status(status)) {
+                alignment_supported = false;
+                break;
+            }
+            if (required_alignment == 0 || pointer.second < required_alignment ||
+                    pointer.first % required_alignment != 0) {
+                alignment_supported = false;
+                break;
+            }
+        }
+        if (!alignment_supported) {
+            continue;
+        }
+
+        entry.algo = result.algo;
+        entry.workspace_bytes = static_cast<size_t>(result.workspaceSize);
+        entry.numerical_flags = numerical_flags;
+        entry.supported = true;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mm_node, const ggml_tensor * bias, ggml_tensor * output) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+    if (!mm_node || !mm_node->src[0] || !mm_node->src[1] || mm_node->src[2] != nullptr ||
+            !bias || !output || mm_node->view_src != nullptr || output->view_src != nullptr ||
+            mm_node->type != GGML_TYPE_F32 || mm_node->src[0]->type != GGML_TYPE_F32 ||
+            mm_node->src[1]->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
+            output->type != GGML_TYPE_F32 || ggml_get_op_params_i32(mm_node, 0) != GGML_PREC_F32) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = mm_node->src[0];
+    const ggml_tensor * src1 = mm_node->src[1];
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1 ||
+            output->ne[2] != 1 || output->ne[3] != 1) {
+        return false;
+    }
+
+    const int64_t k64 = src0->ne[0];
+    const int64_t m64 = src0->ne[1];
+    const int64_t n64 = src1->ne[1];
+    if (k64 <= 0 || m64 <= 0 || n64 <= 1 || k64 > INT_MAX || m64 > INT_MAX || n64 > INT_MAX ||
+            src1->ne[0] != k64 || bias->ne[0] != m64 || output->ne[0] != m64 || output->ne[1] != n64) {
+        return false;
+    }
+
+    // Read-only contiguous reshapes/views are supported. Output views are not:
+    // the destination must own the complete matrix range written by cuBLASLt.
+    if (src0->data == nullptr || src1->data == nullptr || bias->data == nullptr || output->data == nullptr ||
+            !ggml_cuda_lt_ranges_disjoint(output, src0) ||
+            !ggml_cuda_lt_ranges_disjoint(output, src1) ||
+            !ggml_cuda_lt_ranges_disjoint(output, bias) ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(bias) ||
+            !ggml_is_contiguous(output) || src0->nb[0] != sizeof(float) ||
+            src0->nb[1] != k64 * sizeof(float) || src1->nb[0] != sizeof(float) ||
+            src1->nb[1] != k64 * sizeof(float) || bias->nb[0] != sizeof(float) ||
+            output->nb[0] != sizeof(float) || output->nb[1] != m64 * sizeof(float)) {
+        return false;
+    }
+
+    const int m = static_cast<int>(m64);
+    const int n = static_cast<int>(n64);
+    const int k = static_cast<int>(k64);
+    const uint32_t alignment_a = ggml_cuda_lt_pointer_alignment(src0->data);
+    const uint32_t alignment_b = ggml_cuda_lt_pointer_alignment(src1->data);
+    const uint32_t alignment_c = ggml_cuda_lt_pointer_alignment(output->data);
+    const uint32_t alignment_d = alignment_c;
+    const uint32_t alignment_bias = ggml_cuda_lt_pointer_alignment(bias->data);
+    if (alignment_a < sizeof(float) || alignment_b < sizeof(float) ||
+            alignment_c < sizeof(float) || alignment_bias < sizeof(float)) {
+        return false;
+    }
+
+    ggml_cuda_lt_stream_resources & stream_resources = ctx.cublaslt[ctx.device][ctx.curr_stream_no];
+    std::lock_guard<std::mutex> guard(stream_resources.mutex);
+    ++stream_resources.use_clock;
+    auto find_entry = [&]() {
+        return std::find_if(stream_resources.algorithms.begin(), stream_resources.algorithms.end(),
+                [&](const ggml_cuda_lt_matmul_cache_entry & entry) {
+                    return ggml_cuda_lt_cache_key_matches(entry, m, n, k, alignment_a, alignment_b,
+                            alignment_c, alignment_d, alignment_bias);
+                });
+    };
+
+    auto cached = find_entry();
+    if (cached == stream_resources.algorithms.end()) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            return false;
+        }
+        if (stream_resources.handle == nullptr) {
+            CUBLAS_CHECK(cublasLtCreate(&stream_resources.handle));
+            stream_resources.algorithms.reserve(GGML_CUDA_LT_MAX_CACHED_ALGORITHMS);
+        }
+        if (stream_resources.algorithms.size() >= GGML_CUDA_LT_MAX_CACHED_ALGORITHMS) {
+            const auto oldest = std::min_element(stream_resources.algorithms.begin(), stream_resources.algorithms.end(),
+                    [](const ggml_cuda_lt_matmul_cache_entry & lhs, const ggml_cuda_lt_matmul_cache_entry & rhs) {
+                        return lhs.last_used < rhs.last_used;
+                    });
+            GGML_ASSERT(oldest != stream_resources.algorithms.end());
+            ggml_cuda_lt_release_entry(*oldest);
+            stream_resources.algorithms.erase(oldest);
+        }
+
+        ggml_cuda_lt_matmul_cache_entry entry{};
+        entry.m = m;
+        entry.n = n;
+        entry.k = k;
+        entry.alignment_a = alignment_a;
+        entry.alignment_b = alignment_b;
+        entry.alignment_c = alignment_c;
+        entry.alignment_d = alignment_d;
+        entry.alignment_bias = alignment_bias;
+        entry.last_used = stream_resources.use_clock;
+        if (!ggml_cuda_lt_initialize_entry(stream_resources, entry, src0, src1, bias, output, m, n, k)) {
+            ggml_cuda_lt_release_entry(entry);
+            entry.supported = false;
+        }
+        if (entry.supported && entry.workspace_bytes > 0 && stream_resources.workspace == nullptr) {
+            stream_resources.workspace_bytes = GGML_CUDA_LT_MAX_WORKSPACE_BYTES;
+            CUDA_CHECK(cudaMalloc(&stream_resources.workspace, stream_resources.workspace_bytes));
+        }
+        stream_resources.algorithms.push_back(std::move(entry));
+        cached = std::prev(stream_resources.algorithms.end());
+    } else {
+        cached->last_used = stream_resources.use_clock;
+    }
+
+    if (!cached->supported || cached->workspace_bytes > stream_resources.workspace_bytes) {
+        return false;
+    }
+
+    const void * bias_pointer = bias->data;
+    if (!ggml_cuda_lt_optional_status(cublasLtMatmulDescSetAttribute(cached->operation,
+                CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer, sizeof(bias_pointer)))) {
+        return false;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasLtMatmul(stream_resources.handle, cached->operation,
+            &alpha, src0->data, cached->layout_a, src1->data, cached->layout_b,
+            &beta, output->data, cached->layout_c, output->data, cached->layout_d,
+            &cached->algo, stream_resources.workspace, cached->workspace_bytes, ctx.stream());
+    CUBLAS_CHECK(status);
+    return true;
+}
+
+} // namespace
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4240,6 +4604,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            const int output_idx = i + 1;
+            const int output_nodes[] = { output_idx };
+            if (bias_op == GGML_OP_ADD &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, output_nodes, 1) &&
+                    ggml_cuda_try_fuse_mul_mat_add_lt(*cuda_ctx, mm_node, bias_tensor, bias_node)) {
+                return 1;
+            }
+#endif
             continue;
         }
 
