@@ -1224,6 +1224,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     graph->uid = ggml_graph_next_uid();
 
+    // Explicit placements must survive the same-buffer priority upgrade below.
+    // CPU and BLAS share a buffer type but may implement different arithmetic.
+    std::vector<bool> explicit_backend(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        explicit_backend[i] = tensor_backend_id(graph->nodes[i]) != -1;
+    }
+
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
@@ -1352,6 +1359,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         if (ggml_is_view_op(node->op)) {
+            continue;
+        }
+        if (explicit_backend[i]) {
             continue;
         }
         int * node_backend_id = &tensor_backend_id(node);
