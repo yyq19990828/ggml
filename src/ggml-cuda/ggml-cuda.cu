@@ -4057,11 +4057,11 @@ static uint32_t ggml_cuda_lt_pointer_alignment(const void * pointer) {
 }
 
 static bool ggml_cuda_lt_tensor_range(const ggml_tensor * tensor, uintptr_t * begin, uintptr_t * end) {
-    if (tensor == nullptr || tensor->data == nullptr || tensor->type != GGML_TYPE_F32 ||
+    if (tensor == nullptr || tensor->data == nullptr || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) ||
             !ggml_is_contiguous(tensor)) {
         return false;
     }
-    size_t bytes = sizeof(float);
+    size_t bytes = ggml_type_size(tensor->type);
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (tensor->ne[i] <= 0 || static_cast<uint64_t>(tensor->ne[i]) >
                 std::numeric_limits<size_t>::max() / bytes) {
@@ -4108,7 +4108,7 @@ static bool ggml_cuda_lt_optional_status(cublasStatus_t status) {
 }
 
 static bool ggml_cuda_lt_initialize_entry(ggml_cuda_lt_stream_resources & stream_resources,
-        ggml_cuda_lt_matmul_cache_entry & entry, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_cuda_lt_matmul_cache_entry & entry, const void * src0_data, const ggml_tensor * src1,
         const ggml_tensor * bias, const ggml_tensor * output, int m, int n, int k) {
     if (!ggml_cuda_lt_optional_status(cublasLtMatmulDescCreate(
                 &entry.operation, CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F)) ||
@@ -4167,7 +4167,7 @@ static bool ggml_cuda_lt_initialize_entry(ggml_cuda_lt_stream_resources & stream
         return false;
     }
 
-    const uintptr_t address_a = reinterpret_cast<uintptr_t>(src0->data);
+    const uintptr_t address_a = reinterpret_cast<uintptr_t>(src0_data);
     const uintptr_t address_b = reinterpret_cast<uintptr_t>(src1->data);
     const uintptr_t address_c = reinterpret_cast<uintptr_t>(output->data);
     const std::array<std::pair<cublasLtMatmulAlgoCapAttributes_t, std::pair<uintptr_t, uint32_t>>, 4> caps = {{
@@ -4414,7 +4414,7 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
     }
     if (!mm_node || !mm_node->src[0] || !mm_node->src[1] || mm_node->src[2] != nullptr ||
             !bias || !output || mm_node->view_src != nullptr || output->view_src != nullptr ||
-            mm_node->type != GGML_TYPE_F32 || mm_node->src[0]->type != GGML_TYPE_F32 ||
+            mm_node->type != GGML_TYPE_F32 || (mm_node->src[0]->type != GGML_TYPE_F32 && mm_node->src[0]->type != GGML_TYPE_F16) ||
             mm_node->src[1]->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
             output->type != GGML_TYPE_F32 || ggml_get_op_params_i32(mm_node, 0) != GGML_PREC_F32) {
         return false;
@@ -4422,6 +4422,12 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
 
     const ggml_tensor * src0 = mm_node->src[0];
     const ggml_tensor * src1 = mm_node->src[1];
+    if (src0->type == GGML_TYPE_F16 &&
+            (ggml_get_op_params_i32(mm_node, 3) == GGML_PREC_F16 || src0->buffer == nullptr ||
+             ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+             (src0->flags & GGML_TENSOR_FLAG_PARAM) != 0)) {
+        return false;
+    }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1 ||
             output->ne[2] != 1 || output->ne[3] != 1) {
@@ -4443,8 +4449,8 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
             !ggml_cuda_lt_ranges_disjoint(output, src1) ||
             !ggml_cuda_lt_ranges_disjoint(output, bias) ||
             !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(bias) ||
-            !ggml_is_contiguous(output) || src0->nb[0] != sizeof(float) ||
-            src0->nb[1] != k64 * sizeof(float) || src1->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(output) || src0->nb[0] != ggml_type_size(src0->type) ||
+            src0->nb[1] != k64 * ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) ||
             src1->nb[1] != k64 * sizeof(float) || bias->nb[0] != sizeof(float) ||
             output->nb[0] != sizeof(float) || output->nb[1] != m64 * sizeof(float)) {
         return false;
@@ -4453,7 +4459,13 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
     const int m = static_cast<int>(m64);
     const int n = static_cast<int>(n64);
     const int k = static_cast<int>(k64);
-    const uint32_t alignment_a = ggml_cuda_lt_pointer_alignment(src0->data);
+    ggml_cuda_pool_alloc<float> src0_f32_alloc(ctx.pool());
+    const void * src0_data = src0->data;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_f32_alloc.alloc(ggml_nelements(src0));
+        src0_data = src0_f32_alloc.get();
+    }
+    const uint32_t alignment_a = ggml_cuda_lt_pointer_alignment(src0_data);
     const uint32_t alignment_b = ggml_cuda_lt_pointer_alignment(src1->data);
     const uint32_t alignment_c = ggml_cuda_lt_pointer_alignment(output->data);
     const uint32_t alignment_d = alignment_c;
@@ -4505,7 +4517,7 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
         entry.alignment_d = alignment_d;
         entry.alignment_bias = alignment_bias;
         entry.last_used = stream_resources.use_clock;
-        if (!ggml_cuda_lt_initialize_entry(stream_resources, entry, src0, src1, bias, output, m, n, k)) {
+        if (!ggml_cuda_lt_initialize_entry(stream_resources, entry, src0_data, src1, bias, output, m, n, k)) {
             ggml_cuda_lt_release_entry(entry);
             entry.supported = false;
         }
@@ -4528,10 +4540,14 @@ static bool ggml_cuda_try_fuse_mul_mat_add_lt(ggml_backend_cuda_context & ctx,
                 CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer, sizeof(bias_pointer)))) {
         return false;
     }
+    if (src0->type == GGML_TYPE_F16) {
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+        to_fp32(src0->data, src0_f32_alloc.get(), ggml_nelements(src0), ctx.stream());
+    }
     const float alpha = 1.0f;
     const float beta = 0.0f;
     const cublasStatus_t status = cublasLtMatmul(stream_resources.handle, cached->operation,
-            &alpha, src0->data, cached->layout_a, src1->data, cached->layout_b,
+            &alpha, src0_data, cached->layout_a, src1->data, cached->layout_b,
             &beta, output->data, cached->layout_c, output->data, cached->layout_d,
             &cached->algo, stream_resources.workspace, cached->workspace_bytes, ctx.stream());
     CUBLAS_CHECK(status);
