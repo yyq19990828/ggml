@@ -5,6 +5,7 @@ void ggml_cuda_op_sin_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_cos_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 void ggml_cuda_op_log_f32_precise(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_sigmoid_f32_precise(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #endif
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -202,6 +203,12 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_sigmoid_f32_precise(ctx, dst);
+        return;
+    }
+#endif
     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
 }
 
