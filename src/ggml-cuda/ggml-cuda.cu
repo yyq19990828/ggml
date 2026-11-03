@@ -1,3 +1,5 @@
+#include "sam-q8-rhs.cuh"
+#include <stdexcept>
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -2015,8 +2017,50 @@ static bool ggml_cuda_mul_mat_f32_canonical_k_supports(const ggml_tensor * op) {
     return true;
 }
 
+bool ggml_cuda_sam_q8_rhs_supported(int device, const ggml_tensor * op) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || defined(GGML_CUDA_FORCE_CUBLAS)
+    GGML_UNUSED(device); GGML_UNUSED(op);
+    return false;
+#else
+    if (device < 0 || device >= ggml_cuda_info().device_count || ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_ADA_LOVELACE ||
+            op->op != GGML_OP_MUL_MAT || !op->src[0] || !op->src[1]) return false;
+    const auto * a = op->src[0]; const auto * b = op->src[1];
+    return a->type == GGML_TYPE_Q8_0 && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        a->ne[0] >= 32 && a->ne[0] <= 8192 && a->ne[0] % 32 == 0 &&
+        a->ne[1] > 0 && a->ne[1] <= 8192 && b->ne[1] > 0 && b->ne[1] <= 16384 &&
+        a->ne[0] == b->ne[0] && a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+        ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op);
+#endif
+}
+
+bool ggml_cuda_sam_q8_rhs_configure(ggml_tensor * op, int device) {
+    if (!ggml_cuda_sam_q8_rhs_supported(device, op)) return false;
+    op->op_params[7] = GGML_SAM_Q8_RHS;
+    memset(op->op_params + 8, 0, 8 * sizeof(int32_t));
+    op->op_params[15] = 1;
+    ggml_prec_set_src(op, GGML_PREC_Q8, 1);
+    return true;
+}
+
+bool ggml_cuda_sam_q8_rhs_query(const ggml_tensor * op, ggml_sam_q8_rhs_info * info) {
+    if (!info || op->op != GGML_OP_MUL_MAT || op->op_params[7] != GGML_SAM_Q8_RHS || op->op_params[15] != 1) return false;
+    *info = {};
+    info->version = 1; info->path = op->op_params[14];
+    memcpy(&info->launches, op->op_params + 8, sizeof(uint64_t));
+    memcpy(&info->payload_bytes, op->op_params + 10, sizeof(uint64_t));
+    memcpy(&info->allocation_bytes, op->op_params + 12, sizeof(uint64_t));
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+    if (dst->op_params[7] == GGML_SAM_Q8_RHS) {
+        if (!ggml_cuda_sam_q8_rhs_supported(ctx.device, dst) ||
+                ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+            throw std::runtime_error("SAM explicit Q8 RHS cannot honor the requested CUDA shape/storage");
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return; // No MMVQ, cuBLAS, or floating-point fallback.
+    }
     const int32_t reduction_policy = ggml_mul_mat_get_reduction_policy(dst);
     if (reduction_policy != GGML_MUL_MAT_REDUCTION_DEFAULT) {
         if (reduction_policy != GGML_MUL_MAT_REDUCTION_F32_CANONICAL_K_FMA) {
@@ -2811,6 +2855,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
+
+        // Explicit policy validates dynamic input ranges on every execution.
+        // Its required stream synchronization is incompatible with capture.
+        if (node->op == GGML_OP_MUL_MAT && node->op_params[7] == GGML_SAM_Q8_RHS) return false;
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -6351,6 +6399,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    if (op->op == GGML_OP_MUL_MAT && op->op_params[7] == GGML_SAM_Q8_RHS)
+        return ggml_cuda_sam_q8_rhs_supported(dev_ctx->device, op);
     if (op->op == GGML_OP_MUL_MAT) {
         const int32_t reduction_policy = ggml_mul_mat_get_reduction_policy(op);
         if (reduction_policy != GGML_MUL_MAT_REDUCTION_DEFAULT) {
@@ -7037,6 +7087,9 @@ static int ggml_backend_cuda_mul_mat_reduction_policy_version(void) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_cuda_sam_q8_rhs_configure_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_configure;
+    if (strcmp(name, "ggml_cuda_sam_q8_rhs_query_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_query;
+    if (strcmp(name, "ggml_cuda_sam_q8_rhs_capture_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_install_capture;
     if (strcmp(name, GGML_BACKEND_CUDA_MS_DEFORM_ATTN_VERSION_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_ms_deform_attn_version;
     }

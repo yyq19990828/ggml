@@ -1,3 +1,6 @@
+#include "sam-q8-rhs.cuh"
+#include <atomic>
+#include <stdexcept>
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
@@ -132,6 +135,44 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+static ggml_sam_q8_rhs_capture sam_q8_capture = nullptr;
+static void * sam_q8_capture_user = nullptr;
+static std::atomic<bool> sam_q8_capture_enabled{false};
+
+void ggml_cuda_sam_q8_rhs_install_capture(ggml_sam_q8_rhs_capture callback, void * user) {
+    sam_q8_capture_enabled.store(false, std::memory_order_release);
+    sam_q8_capture_user = user;
+    sam_q8_capture = callback;
+    sam_q8_capture_enabled.store(callback != nullptr, std::memory_order_release);
+}
+
+// Bitwise positive-F32 ordering avoids fast-math FTZ turning a nonzero
+// subnormal into a supported zero. Validate the complete actual RHS every run.
+static __global__ void sam_q8_rhs_check(const float * x, int64_t blocks, unsigned int * invalid) {
+    const int64_t block = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (block >= blocks) return;
+    unsigned int maximum = 0;
+    for (int i = 0; i < 32; ++i) {
+        const unsigned int bits = __float_as_uint(x[block * 32 + i]) & 0x7fffffffU;
+        if (bits >= 0x7f800000U) { atomicExch(invalid, 1U); return; }
+        maximum = maximum > bits ? maximum : bits;
+    }
+    const unsigned int lower = __float_as_uint(1.e-30f), upper = __float_as_uint(1.e30f);
+    if (maximum > upper || (maximum != 0 && maximum < lower)) atomicExch(invalid, 1U);
+}
+
+static void sam_q8_rhs_validate(ggml_backend_cuda_context & ctx, const ggml_tensor * src, cudaStream_t stream) {
+    ggml_cuda_pool_alloc<unsigned int> invalid(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(invalid.get(), 0, sizeof(unsigned int), stream));
+    const int64_t blocks = ggml_nelements(src) / 32;
+    sam_q8_rhs_check<<<(blocks + 255) / 256, 256, 0, stream>>>((const float *)src->data, blocks, invalid.get());
+    CUDA_CHECK(cudaGetLastError());
+    unsigned int host_invalid = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&host_invalid, invalid.get(), sizeof(host_invalid), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host_invalid) throw std::runtime_error("SAM Q8 RHS requires finite F32 and each nonzero block maximum in [1e-30,1e30]");
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -185,6 +226,8 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        const bool sam_explicit = dst->op_params[7] == GGML_SAM_Q8_RHS;
+        if (sam_explicit) sam_q8_rhs_validate(ctx, src1, stream);
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -211,6 +254,10 @@ void ggml_cuda_mul_mat_q(
             CUDA_CHECK(cudaGetLastError());
         }
 
+        const size_t sam_payload_bytes = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block;
+        if (sam_explicit && sam_q8_capture_enabled.load(std::memory_order_acquire))
+            sam_q8_capture(dst, src1_q8_1.get(), sam_payload_bytes, nbytes_src1_q8_1, (void *)stream, sam_q8_capture_user);
+
         // Stride depends on quantization format
         const int64_t s12 = use_native_fp4 ?
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
@@ -225,6 +272,18 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        if (sam_explicit) {
+            uint64_t launches = 0;
+            memcpy(&launches, dst->op_params + 8, sizeof(launches));
+            if (launches == UINT64_MAX) throw std::runtime_error("SAM Q8 RHS execution counter overflow");
+            ++launches;
+            const uint64_t payload = sam_payload_bytes, allocation = nbytes_src1_q8_1;
+            memcpy(dst->op_params + 8, &launches, sizeof(launches));
+            memcpy(dst->op_params + 10, &payload, sizeof(payload));
+            memcpy(dst->op_params + 12, &allocation, sizeof(allocation));
+            dst->op_params[14] = 1;
+        }
+
         return;
     }
 
