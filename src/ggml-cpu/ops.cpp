@@ -19,8 +19,8 @@ void ggml_compute_forward_fma(const ggml_compute_params * params, ggml_tensor * 
 
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, c) && ggml_are_same_shape(a, dst));
-    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(a, dst) && ggml_can_repeat(b, dst) && ggml_can_repeat(c, dst));
+    GGML_ASSERT(ggml_is_contiguous(dst));
 
     const float * av = static_cast<const float *>(a->data);
     const float * bv = static_cast<const float *>(b->data);
@@ -31,8 +31,25 @@ void ggml_compute_forward_fma(const ggml_compute_params * params, ggml_tensor * 
     const int64_t begin = chunk * params->ith;
     const int64_t end = std::min(begin + chunk, n);
 
+    const bool dense = ggml_are_same_shape(a, dst) && ggml_are_same_shape(b, dst) &&
+        ggml_are_same_shape(c, dst) && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c);
+    if (dense) {
+        for (int64_t i = begin; i < end; ++i) out[i] = std::fma(av[i], bv[i], cv[i]);
+        return;
+    }
     for (int64_t i = begin; i < end; ++i) {
-        out[i] = std::fma(av[i], bv[i], cv[i]);
+        int64_t q = i;
+        int64_t coord[GGML_MAX_DIMS];
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) { coord[d] = q % dst->ne[d]; q /= dst->ne[d]; }
+        const ggml_tensor * src[3] = { a, b, c };
+        const float * val[3] = { av, bv, cv };
+        float x[3];
+        for (int k = 0; k < 3; ++k) {
+            int64_t off = 0;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) off += (coord[d] % src[k]->ne[d]) * src[k]->nb[d];
+            x[k] = *reinterpret_cast<const float *>(reinterpret_cast<const char *>(val[k]) + off);
+        }
+        out[i] = std::fma(x[0], x[1], x[2]);
     }
 }
 

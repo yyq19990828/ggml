@@ -851,3 +851,28 @@ kernel void kernel_win_unpart_f32(
 
     dst_ptr[i0] = src_ptr[i0];
 }
+
+kernel void kernel_fma_f32(
+    constant ggml_metal_kargs_fma & args,
+    device const char * a,
+    device const char * b,
+    device const char * c,
+    device       char * dst,
+    uint gid[[thread_position_in_grid]]) {
+    const int64_t total = args.ne[0] * args.ne[1] * args.ne[2] * args.ne[3];
+    if ((int64_t) gid >= total) return;
+    int64_t q = gid;
+    int64_t off[3] = { 0, 0, 0 };
+    for (int d = 0; d < 4; ++d) {
+        const int64_t coord = q % args.ne[d];
+        q /= args.ne[d];
+        for (int k = 0; k < 3; ++k) {
+            off[k] += (coord % args.src_ne[k*4+d]) * args.src_nb[k*4+d];
+        }
+    }
+    device const float * ap = (device const float *)(a + off[0]);
+    device const float * bp = (device const float *)(b + off[1]);
+    device const float * cp = (device const float *)(c + off[2]);
+    device float * out = (device float *) dst;
+    out[gid] = fma(ap[0], bp[0], cp[0]);
+}

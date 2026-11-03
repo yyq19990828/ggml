@@ -1426,4 +1426,11 @@ typedef struct {
     int32_t  npx;
     int32_t  w;
 } ggml_metal_kargs_win_unpart;
+
+typedef struct {
+    int64_t ne[4];
+    int64_t src_ne[12];
+    uint64_t src_nb[12];
+} ggml_metal_kargs_fma;
+
 #endif // GGML_METAL_IMPL

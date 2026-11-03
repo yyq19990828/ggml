@@ -1852,6 +1852,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_FMA:
+            return op->type == GGML_TYPE_F32 && op->src[0] && op->src[1] && op->src[2] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(op->src[0], op) && ggml_can_repeat(op->src[1], op) && ggml_can_repeat(op->src[2], op) &&
+                ggml_is_contiguous(op);
+
         case GGML_OP_MUL_MAT:
             if (ggml_mul_mat_get_reduction_policy(op) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
                 return false;

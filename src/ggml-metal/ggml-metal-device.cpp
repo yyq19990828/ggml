@@ -2780,3 +2780,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_win_unpart(ggml_
 
     return res;
 }
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fma(ggml_metal_library_t lib) {
+    const char * name = "kernel_fma_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    return res;
+}

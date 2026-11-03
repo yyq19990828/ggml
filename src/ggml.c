@@ -2109,8 +2109,7 @@ struct ggml_tensor * ggml_fma(
         struct ggml_tensor  * c) {
     GGML_ASSERT(a != NULL && b != NULL && c != NULL);
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, c));
-    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_can_repeat(b, a) && ggml_can_repeat(c, a));
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
     result->op = GGML_OP_FMA;

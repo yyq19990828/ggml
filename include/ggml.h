@@ -928,7 +928,10 @@ extern "C" {
             struct ggml_tensor  * b);
 
     // Elementwise correctly-rounded F32 fused multiply-add: a * b + c.
-    // The experimental implementation requires equal shapes and contiguous F32 inputs.
+    // `a` defines the output shape. `b` and `c` must be F32 tensors repeatable
+    // to `a`; all three inputs may use arbitrary byte strides, including zero
+    // strides. The result is a new contiguous F32 tensor.
+#define GGML_FMA_LAYOUT_VERSION 1
     GGML_API struct ggml_tensor * ggml_fma(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

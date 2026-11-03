@@ -299,6 +299,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_add_id(ctx, idx);
             } break;
+        case GGML_OP_FMA:
+            n_fuse = ggml_metal_op_fma(ctx, idx);
+            break;
         case GGML_OP_REPEAT:
             {
                 n_fuse = ggml_metal_op_repeat(ctx, idx);
@@ -6121,5 +6124,27 @@ int ggml_metal_op_win_unpart(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
+    return 1;
+}
+
+int ggml_metal_op_fma(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const int64_t n = ggml_nelements(op);
+    if (n == 0) return 1;
+    const ggml_tensor * src[3] = { op->src[0], op->src[1], op->src[2] };
+    ggml_metal_kargs_fma args = {};
+    for (int d = 0; d < 4; ++d) args.ne[d] = op->ne[d];
+    for (int k = 0; k < 3; ++k) for (int d = 0; d < 4; ++d) {
+        args.src_ne[k*4+d] = src[k]->ne[d];
+        args.src_nb[k*4+d] = src[k]->nb[d];
+    }
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_fma(ctx->lib);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    for (int k = 0; k < 3; ++k) ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src[k]), k + 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), n);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     return 1;
 }

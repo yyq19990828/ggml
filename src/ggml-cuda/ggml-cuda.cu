@@ -6437,12 +6437,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
-                ggml_are_same_shape(op->src[0], op->src[1]) &&
-                ggml_are_same_shape(op->src[0], op->src[2]) &&
                 ggml_are_same_shape(op->src[0], op) &&
-                ggml_is_contiguous(op->src[0]) &&
-                ggml_is_contiguous(op->src[1]) &&
-                ggml_is_contiguous(op->src[2]) &&
+                ggml_can_repeat(op->src[1], op) &&
+                ggml_can_repeat(op->src[2], op) &&
                 ggml_is_contiguous(op);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
