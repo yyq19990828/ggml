@@ -283,6 +283,7 @@ if (CUDAToolkit_FOUND)
          "${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/log-f32-precise.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/ms-deform-attn.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/sigmoid-f32-precise.cu")
     set_source_files_properties(${GGML_CUDA_FAST_MATH_SOURCES}
                                 PROPERTIES COMPILE_OPTIONS "-use_fast_math")
@@ -299,6 +300,8 @@ if (CUDAToolkit_FOUND)
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/sigmoid-f32-precise.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
 set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
+                            PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/ms-deform-attn.cu"
                             PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")

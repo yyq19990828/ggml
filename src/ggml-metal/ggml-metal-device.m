@@ -1556,6 +1556,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
     switch (op->op) {
         case GGML_OP_POW_BASE_F32:
+        case GGML_OP_MS_DEFORM_ATTN:
             return false;
         case GGML_OP_SCALE:
         case GGML_OP_FILL:

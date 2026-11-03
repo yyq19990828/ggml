@@ -607,6 +607,9 @@ extern "C" {
         // Local experiment: powf(positive_finite_base, contiguous_F32_exponent).
         GGML_OP_POW_BASE_F32,
 
+        // CUDA-only F32 multi-scale deformable attention.
+        GGML_OP_MS_DEFORM_ATTN,
+
         GGML_OP_COUNT,
     };
 

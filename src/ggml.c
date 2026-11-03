@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-ms-deform-attn.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -1101,9 +1102,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "FMA",
     "POW_BASE_F32",
+    "MS_DEFORM_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1220,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "fma(x,y,z)",
     "powf(base,x)",
+    "ms_deform_attn(values, shapes, starts, locations, weights)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3293,6 +3296,59 @@ struct ggml_tensor * ggml_group_norm_inplace(
         int                   n_groups,
         float                 eps) {
     return ggml_group_norm_impl(ctx, a, n_groups, eps, true);
+}
+
+struct ggml_tensor * ggml_ms_deform_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor * values,
+        struct ggml_tensor * spatial_shapes,
+        struct ggml_tensor * level_start_index,
+        struct ggml_tensor * sampling_locations,
+        struct ggml_tensor * attention_weights) {
+    GGML_ASSERT(ctx != NULL && values != NULL && spatial_shapes != NULL && level_start_index != NULL &&
+        sampling_locations != NULL && attention_weights != NULL);
+    GGML_ASSERT(values->type == GGML_TYPE_F32 && sampling_locations->type == GGML_TYPE_F32 &&
+        attention_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(spatial_shapes->type == GGML_TYPE_I32 && level_start_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(values) && ggml_is_contiguous(spatial_shapes) &&
+        ggml_is_contiguous(level_start_index) && ggml_is_contiguous(sampling_locations) &&
+        ggml_is_contiguous(attention_weights));
+
+    const int64_t channels = values->ne[0];
+    const int64_t heads = values->ne[1];
+    const int64_t spatial_size = values->ne[2];
+    const int64_t batch = values->ne[3];
+    const int64_t points = sampling_locations->ne[1];
+    const int64_t levels = spatial_shapes->ne[1];
+
+    GGML_ASSERT(channels > 0 && heads > 0 && spatial_size > 0 && batch > 0 && points > 0 && levels > 0);
+    GGML_ASSERT(spatial_shapes->ne[0] == 2 && spatial_shapes->ne[2] == 1 && spatial_shapes->ne[3] == 1);
+    GGML_ASSERT(level_start_index->ne[0] == levels && level_start_index->ne[1] == 1 &&
+        level_start_index->ne[2] == 1 && level_start_index->ne[3] == 1);
+    GGML_ASSERT(sampling_locations->ne[0] == 2 && sampling_locations->ne[2] == levels &&
+        sampling_locations->ne[3] > 0);
+    GGML_ASSERT(attention_weights->ne[0] == points && attention_weights->ne[1] == levels &&
+        attention_weights->ne[2] == heads && attention_weights->ne[3] > 0);
+    GGML_ASSERT(attention_weights->ne[3] % batch == 0);
+
+    const int64_t queries = attention_weights->ne[3] / batch;
+    GGML_ASSERT(queries > 0 && heads <= INT64_MAX / queries);
+    const int64_t heads_queries = heads * queries;
+    GGML_ASSERT(heads_queries <= INT64_MAX / batch);
+    const int64_t row_count = heads_queries * batch;
+    GGML_ASSERT(sampling_locations->ne[3] == row_count);
+    GGML_ASSERT(attention_weights->ne[3] == queries * batch);
+    GGML_ASSERT(row_count <= INT64_MAX / channels);
+
+    const int64_t ne[4] = { channels, heads, queries, batch };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_MS_DEFORM_ATTN;
+    result->src[0] = values;
+    result->src[1] = spatial_shapes;
+    result->src[2] = level_start_index;
+    result->src[3] = sampling_locations;
+    result->src[4] = attention_weights;
+    return result;
 }
 
 // ggml_l2_norm

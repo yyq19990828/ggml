@@ -1811,6 +1811,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_pow_base_f32(params, tensor);
             } break;
+        case GGML_OP_MS_DEFORM_ATTN:
+            {
+                GGML_ABORT("MS_DEFORM_ATTN is CUDA-only");
+            } break;
         case GGML_OP_SUM:
             {
                 ggml_compute_forward_sum(params, tensor);
@@ -2510,6 +2514,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_NONE:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_MS_DEFORM_ATTN:
+            {
+                GGML_ABORT("MS_DEFORM_ATTN is CUDA-only");
             } break;
         case GGML_OP_COUNT:
             {

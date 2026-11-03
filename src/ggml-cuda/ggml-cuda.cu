@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-mul-mat-reduction.h"
+#include "ggml-ms-deform-attn.h"
 #include "ggml-cuda/ggml-cuda-mul-mat-add-view-fusion.cuh"
 
 #include "ggml-cuda/allreduce.cuh"
@@ -30,6 +31,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fma.cuh"
 #include "ggml-cuda/pow-base-f32.cuh"
+#include "ggml-cuda/ms-deform-attn.cuh"
 #include "ggml-cuda/sam-precise.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2293,6 +2295,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
+        case GGML_OP_MS_DEFORM_ATTN:
+            ggml_cuda_op_ms_deform_attn(ctx, dst);
+            break;
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -6292,6 +6297,47 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
+static bool ggml_cuda_ms_deform_attn_supported(const ggml_tensor * op) {
+    if (op->type != GGML_TYPE_F32 || op->src[0] == nullptr || op->src[1] == nullptr ||
+            op->src[2] == nullptr || op->src[3] == nullptr || op->src[4] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * values = op->src[0];
+    const ggml_tensor * spatial_shapes = op->src[1];
+    const ggml_tensor * level_start_index = op->src[2];
+    const ggml_tensor * sampling_locations = op->src[3];
+    const ggml_tensor * attention_weights = op->src[4];
+    if (values->type != GGML_TYPE_F32 || spatial_shapes->type != GGML_TYPE_I32 ||
+            level_start_index->type != GGML_TYPE_I32 || sampling_locations->type != GGML_TYPE_F32 ||
+            attention_weights->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(op) || !ggml_is_contiguous(values) || !ggml_is_contiguous(spatial_shapes) ||
+            !ggml_is_contiguous(level_start_index) || !ggml_is_contiguous(sampling_locations) ||
+            !ggml_is_contiguous(attention_weights)) {
+        return false;
+    }
+    const int64_t batch = values->ne[3];
+    const int64_t heads = values->ne[1];
+    const int64_t levels = spatial_shapes->ne[1];
+    const int64_t points = sampling_locations->ne[1];
+    if (batch <= 0 || heads <= 0 || levels <= 0 || points <= 0 || attention_weights->ne[3] % batch != 0) {
+        return false;
+    }
+    const int64_t queries = attention_weights->ne[3] / batch;
+    if (queries <= 0 || heads > INT64_MAX / queries || heads * queries > INT64_MAX / batch) {
+        return false;
+    }
+    return spatial_shapes->ne[0] == 2 && spatial_shapes->ne[2] == 1 && spatial_shapes->ne[3] == 1 &&
+        level_start_index->ne[0] == levels && level_start_index->ne[1] == 1 &&
+        level_start_index->ne[2] == 1 && level_start_index->ne[3] == 1 &&
+        sampling_locations->ne[0] == 2 && sampling_locations->ne[2] == levels &&
+        sampling_locations->ne[3] == heads * queries * batch &&
+        attention_weights->ne[0] == points && attention_weights->ne[1] == levels &&
+        attention_weights->ne[2] == heads && attention_weights->ne[3] == queries * batch &&
+        op->ne[0] == values->ne[0] && op->ne[1] == heads && op->ne[2] == queries && op->ne[3] == batch;
+}
+
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
@@ -6320,6 +6366,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_MS_DEFORM_ATTN:
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            return false;
+#else
+            return ggml_cuda_ms_deform_attn_supported(op);
+#endif
         case GGML_OP_POW_BASE_F32: {
             const ggml_tensor * src = op->src[0];
             const float base = ggml_get_op_params_f32(op, 0);
@@ -6967,6 +7019,14 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static int ggml_backend_cuda_ms_deform_attn_version(void) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return 0;
+#else
+    return GGML_MS_DEFORM_ATTN_VERSION;
+#endif
+}
+
 static int ggml_backend_cuda_mul_mat_reduction_policy_version(void) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     return 0;
@@ -6977,6 +7037,9 @@ static int ggml_backend_cuda_mul_mat_reduction_policy_version(void) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, GGML_BACKEND_CUDA_MS_DEFORM_ATTN_VERSION_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_ms_deform_attn_version;
+    }
     if (strcmp(name, GGML_BACKEND_CUDA_MUL_MAT_REDUCTION_POLICY_VERSION_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_mul_mat_reduction_policy_version;
     }
