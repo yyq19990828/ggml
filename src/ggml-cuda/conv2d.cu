@@ -1,4 +1,5 @@
 #include "conv2d.cuh"
+#include "cudnn.cuh"
 #include "convert.cuh"
 #include "mma.cuh"
 
@@ -348,6 +349,13 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // same number of input channels
     GGML_ASSERT(input->ne[2] == kernel->ne[2]);
+
+#ifdef GGML_CUDA_CUDNN
+    if (ggml_cuda_cudnn_supports(dst)) {
+        ggml_cuda_cudnn_conv2d(ctx, dst);
+        return;
+    }
+#endif
 
     cudaStream_t st = ctx.stream();
 

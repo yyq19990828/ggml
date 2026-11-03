@@ -9,6 +9,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/cudnn.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -714,7 +715,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(GGML_CUDA_CUDNN) || (defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA))
     ggml_cuda_set_device(device);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -729,6 +730,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     // those workspaces.
     cuda_graphs.clear();
 #endif
+#endif
+
+#ifdef GGML_CUDA_CUDNN
+    ggml_cuda_cudnn_release(*this);
 #endif
 
     if (copy_event != nullptr) {
@@ -2858,6 +2863,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
+
+#ifdef GGML_CUDA_CUDNN
+        // Legacy cuDNN descriptors and pooled workspace are prepared outside
+        // capture. Reject the whole partition before cudaStreamBeginCapture.
+        if (node->op == GGML_OP_CONV_2D && ggml_cuda_cudnn_supports(node)) return false;
+#endif
 
         // Explicit policy validates dynamic input ranges on every execution.
         // Its required stream synchronization is incompatible with capture.
@@ -7105,8 +7116,19 @@ static int ggml_backend_cuda_mul_mat_reduction_policy_version(void) {
 #endif
 }
 
+static int ggml_backend_cuda_cudnn_version(void) {
+#ifdef GGML_CUDA_CUDNN
+    return ggml_cuda_cudnn_version();
+#else
+    return 0;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_cudnn_version") == 0) {
+        return (void *) ggml_backend_cuda_cudnn_version;
+    }
     if (strcmp(name, "ggml_cuda_sam_q8_rhs_configure_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_configure;
     if (strcmp(name, "ggml_cuda_sam_q8_rhs_query_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_query;
     if (strcmp(name, "ggml_cuda_sam_q8_rhs_capture_v1") == 0) return (void *)ggml_cuda_sam_q8_rhs_install_capture;

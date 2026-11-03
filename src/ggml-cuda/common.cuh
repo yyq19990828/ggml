@@ -1535,6 +1535,10 @@ struct ggml_cuda_lt_stream_resources {
 };
 #endif
 
+#ifdef GGML_CUDA_CUDNN
+struct ggml_cuda_cudnn_context;
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1544,6 +1548,10 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+#ifdef GGML_CUDA_CUDNN
+    // Opaque per-device/stream resources are destroyed before their streams.
+    ggml_cuda_cudnn_context * cudnn[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+#endif
 
 #if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_cuda_lt_stream_resources cublaslt[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
