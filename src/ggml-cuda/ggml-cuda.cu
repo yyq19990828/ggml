@@ -1547,6 +1547,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // A short single-output explicit-F32 dot can lose relative accuracy under
+    // cancellation even with cuBLAS pedantic accumulation.
+    if (precise_f32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+        ne01 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+        ne10 >= 1 && ne10 <= 1024) {
+        ggml_cuda_sam_f32_short_dot((const float *) src0_ptr, (const float *) src1_ptr,
+                                    (float *) dst_ptr, (int) ne10, main_stream);
+    } else
+#endif
     if (compute_type == GGML_TYPE_F32 && !precise_f32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,

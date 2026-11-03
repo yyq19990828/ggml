@@ -6,6 +6,31 @@
 #include <climits>
 #include <cstdint>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void sam_f32_short_dot_kernel(const float * lhs, const float * rhs,
+                                                float * dst, int k) {
+    __shared__ double partial[256];
+    double sum = 0.0;
+    for (int index = threadIdx.x; index < k; index += blockDim.x) {
+        sum += double(lhs[index]) * double(rhs[index]);
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int offset = 128; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) partial[threadIdx.x] += partial[threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) dst[0] = __double2float_rn(partial[0]);
+}
+
+void ggml_cuda_sam_f32_short_dot(const float * lhs, const float * rhs, float * dst,
+                                int k, cudaStream_t stream) {
+    GGML_ASSERT(k >= 1 && k <= 1024);
+    sam_f32_short_dot_kernel<<<1, 256, 0, stream>>>(lhs, rhs, dst, k);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
 static __global__ void sam_window_f32(const float * src, float * dst, int64_t count,
         int64_t channels, int64_t width, int64_t height, int64_t window, int64_t windows_x,
         bool partition) {
