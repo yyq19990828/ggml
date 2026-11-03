@@ -29,6 +29,14 @@
     float,  float4,    simdgroup_float8x8
     //half,   half4,     simdgroup_half8x8
 
+#define FA_TYPES_F32_PREC \
+    float,  float4,    simdgroup_float8x8,  \
+    float,  float4x4,  simdgroup_float8x8, \
+    float,  float4x4,  simdgroup_float8x8, \
+    float,             simdgroup_float8x8, \
+    float,  float2,    simdgroup_float8x8, \
+    float,  float4,    simdgroup_float8x8
+
 typedef decltype(kernel_flash_attn_ext<FA_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 64, 64>) flash_attn_ext_t;
 
 template [[host_name("kernel_flash_attn_ext_f32_dk32_dv32"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  32,  32>;
@@ -48,6 +56,12 @@ template [[host_name("kernel_flash_attn_ext_f32_dk320_dv256")]]  kernel flash_at
 template [[host_name("kernel_flash_attn_ext_f32_dk512_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  512, 512>;
 template [[host_name("kernel_flash_attn_ext_f32_dk576_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  576, 512>;
 
+// Explicit F32 precision preserves Query values as well as F32 K/V.
+template [[host_name("kernel_flash_attn_ext_f32_dk32_dv32_prec_f32"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32_PREC, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  32,  32>;
+template [[host_name("kernel_flash_attn_ext_f32_dk64_dv64_prec_f32"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32_PREC, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  64,  64>;
+
 #undef FA_TYPES
 #undef FA_TYPES_BF
 #undef FA_TYPES_F32
+
+#undef FA_TYPES_F32_PREC

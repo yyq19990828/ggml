@@ -446,6 +446,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_upscale(ctx, idx);
             } break;
+        case GGML_OP_WIN_PART:
+            {
+                n_fuse = ggml_metal_op_win_part(ctx, idx);
+            } break;
+        case GGML_OP_WIN_UNPART:
+            {
+                n_fuse = ggml_metal_op_win_unpart(ctx, idx);
+            } break;
         case GGML_OP_PAD:
             {
                 n_fuse = ggml_metal_op_pad(ctx, idx);
@@ -3070,11 +3078,24 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_prec_f32(const ggml_tensor * op) {
+    // K/V types match by the backend's supported-op contract.
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+    return ggml_flash_attn_ext_get_prec(op) == GGML_PREC_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 && dk == dv && (dk == 32 || dk == 64);
+}
+
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
+
+    // The default vector kernel stages Q in half even for F32 K/V.
+    if (ggml_metal_op_flash_attn_ext_use_prec_f32(op)) {
+        return false;
+    }
 
     // use vec kernel if the batch size is small and if the head size is supported
     return (ne01 < 20) && (ne00 % 32 == 0);
@@ -3150,6 +3171,11 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
 // n_kv_max is only an upper bound on their number per mask row, used to size the index lists
 static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    // Sparse attention also uses the half-Query vector kernel.
+    if (ggml_metal_op_flash_attn_ext_use_prec_f32(op)) {
+        return 0;
+    }
 
     int32_t n_kv_max = 0;
     memcpy(&n_kv_max, ((const int32_t *) op->op_params) + 4, sizeof(n_kv_max));
@@ -3762,12 +3788,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const int is_q = !use_kv_f16 && ggml_is_quantized(op->src[1]->type) ? 1 : 0;
 
         // shared memory layout (halfs unless noted):
-        //   queries/attn/result: Q*(DK + 2*PAD2(DV,64) + 4*C)
+        //   queries/attn/result: Q*(QHS*DK + 2*PAD2(DV,64) + 4*C)
         //   quantized KV scratch: 16*32*NSG (only when is_q)
         const int64_t dv_pad = GGML_PAD(ne20, 64);
+        const int qhs = ggml_metal_op_flash_attn_ext_use_prec_f32(op) ? sizeof(float)/sizeof(ggml_fp16_t) : 1;
 
         auto fa_smem = [&](int32_t nsg) -> size_t {
-            const size_t smem_half = nqptg*(ne00 + 2*dv_pad + 4*ncpsg) + is_q*(16*32*nsg);
+            const size_t smem_half = nqptg*(qhs*ne00 + 2*dv_pad + 4*ncpsg) + is_q*(16*32*nsg);
             return GGML_PAD(smem_half*sizeof(ggml_fp16_t), 16);
         };
 
@@ -6005,6 +6032,94 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
     }
+
+    return 1;
+}
+
+int ggml_metal_op_win_part(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t npx = ((const int32_t *)(op->op_params))[0];
+    const int32_t npy = ((const int32_t *)(op->op_params))[1];
+    const int32_t w   = ((const int32_t *)(op->op_params))[2];
+
+    ggml_metal_kargs_win_part args = {
+        /*.ne00 =*/ (int64_t)  op->src[0]->ne[0],
+        /*.ne01 =*/ (int64_t)  op->src[0]->ne[1],
+        /*.ne02 =*/ (int64_t)  op->src[0]->ne[2],
+        /*.nb00 =*/ (uint64_t) op->src[0]->nb[0],
+        /*.nb01 =*/ (uint64_t) op->src[0]->nb[1],
+        /*.nb02 =*/ (uint64_t) op->src[0]->nb[2],
+        /*.ne0  =*/ (int64_t)  op->ne[0],
+        /*.ne1  =*/ (int64_t)  op->ne[1],
+        /*.ne2  =*/ (int64_t)  op->ne[2],
+        /*.npx  =*/ npx,
+        /*.npy  =*/ npy,
+        /*.w    =*/ w,
+    };
+
+    const int64_t np = (int64_t)npx * npy;
+    const int64_t total = op->ne[0] * op->ne[1] * op->ne[2] * np;
+
+    auto pipeline = ggml_metal_library_get_pipeline_win_part(lib, op);
+
+    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) total);
+    const int ntg = (int) ((total + nth - 1) / nth);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_win_unpart(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t w = ((const int32_t *)(op->op_params))[0];
+
+    // Recompute npx from output width (same formula as CPU impl)
+    const int64_t w0 = op->ne[1];
+    const int px = (w - (int)(w0 % w)) % w;
+    const int npx = (int)(px + w0) / w;
+
+    ggml_metal_kargs_win_unpart args = {
+        /*.ne00 =*/ (int64_t)  op->src[0]->ne[0],
+        /*.ne01 =*/ (int64_t)  op->src[0]->ne[1],
+        /*.ne02 =*/ (int64_t)  op->src[0]->ne[2],
+        /*.nb00 =*/ (uint64_t) op->src[0]->nb[0],
+        /*.nb01 =*/ (uint64_t) op->src[0]->nb[1],
+        /*.nb02 =*/ (uint64_t) op->src[0]->nb[2],
+        /*.nb03 =*/ (uint64_t) op->src[0]->nb[3],
+        /*.ne0  =*/ (int64_t)  op->ne[0],
+        /*.ne1  =*/ (int64_t)  op->ne[1],
+        /*.ne2  =*/ (int64_t)  op->ne[2],
+        /*.npx  =*/ npx,
+        /*.w    =*/ w,
+    };
+
+    const int64_t total = op->ne[0] * op->ne[1] * op->ne[2];
+
+    auto pipeline = ggml_metal_library_get_pipeline_win_unpart(lib, op);
+
+    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) total);
+    const int ntg = (int) ((total + nth - 1) / nth);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
     return 1;
 }
