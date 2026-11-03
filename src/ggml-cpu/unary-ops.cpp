@@ -1,5 +1,7 @@
 #include "unary-ops.h"
 
+#include <cmath>
+
 static inline float op_abs(float x) {
     return fabsf(x);
 }
@@ -292,6 +294,24 @@ void ggml_compute_forward_sin(const ggml_compute_params * params, ggml_tensor * 
 
 void ggml_compute_forward_cos(const ggml_compute_params * params, ggml_tensor * dst) {
     unary_op<op_cos>(params, dst);
+}
+
+void ggml_compute_forward_pow_base_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const float base = ggml_get_op_params_f32(dst, 0);
+
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    GGML_ASSERT(std::isfinite(base) && base > 0.0f);
+
+    const float * input = (const float *) src->data;
+    float * output = (float *) dst->data;
+    const int64_t count = ggml_nelements(dst);
+    for (int64_t i = params->ith; i < count; i += params->nth) {
+        output[i] = ::powf(base, input[i]);
+    }
 }
 
 void ggml_compute_forward_log(const ggml_compute_params * params, ggml_tensor * dst) {

@@ -1,6 +1,9 @@
 #include "unary.cuh"
 #include "convert.cuh"
 
+void ggml_cuda_op_sin_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_cos_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
 }
@@ -220,11 +223,19 @@ void ggml_cuda_op_sqrt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_sin(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_unary<op_sin>(ctx, dst);
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_sin_f32_nonfast(ctx, dst);
+    } else {
+        ggml_cuda_op_unary<op_sin>(ctx, dst);
+    }
 }
 
 void ggml_cuda_op_cos(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_unary<op_cos>(ctx, dst);
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_cos_f32_nonfast(ctx, dst);
+    } else {
+        ggml_cuda_op_unary<op_cos>(ctx, dst);
+    }
 }
 
 void ggml_cuda_op_log(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

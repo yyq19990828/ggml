@@ -281,6 +281,8 @@ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation" 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
+option(GGML_BUILD_POSITION_POWER_PROBE "ggml: build isolated scalar-base F32 power probe" OFF)
+option(GGML_BUILD_GROUP_NORM_AFFINE_PROBE "ggml: build isolated CUDA GroupNorm affine probe" OFF)
 
 #
 # dependencies
@@ -303,6 +305,16 @@ include(GNUInstallDirs)
 #
 
 add_subdirectory(src)
+
+if (GGML_BUILD_POSITION_POWER_PROBE)
+    add_executable(ggml-position-power-probe tools/position_power/position_power_probe.cpp)
+    target_link_libraries(ggml-position-power-probe PRIVATE ggml)
+endif()
+
+if (GGML_BUILD_GROUP_NORM_AFFINE_PROBE)
+    add_executable(ggml-group-norm-affine-probe tools/group_norm_affine/group_norm_affine_probe.cpp)
+    target_link_libraries(ggml-group-norm-affine-probe PRIVATE ggml)
+endif()
 
 #
 # tests and examples

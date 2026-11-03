@@ -4,9 +4,11 @@
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
+#include "ggml-mul-mat-reduction.h"
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -440,6 +442,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_POW_BASE_F32: {
+            const float base = ggml_get_op_params_f32(op, 0);
+            return src0 != nullptr &&
+                op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(src0, op) &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
+                std::isfinite(base) && base > 0.0f;
+        }
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return
@@ -451,6 +461,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (ggml_mul_mat_get_reduction_policy(op) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
+                return false;
+            }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;

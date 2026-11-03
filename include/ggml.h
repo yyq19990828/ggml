@@ -601,6 +601,12 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Local experiment: explicit, non-contractable F32 multiply-add op.
+        GGML_OP_FMA,
+
+        // Local experiment: powf(positive_finite_base, contiguous_F32_exponent).
+        GGML_OP_POW_BASE_F32,
+
         GGML_OP_COUNT,
     };
 
@@ -917,6 +923,21 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Elementwise correctly-rounded F32 fused multiply-add: a * b + c.
+    // The experimental implementation requires equal shapes and contiguous F32 inputs.
+    GGML_API struct ggml_tensor * ggml_fma(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
+    // Elementwise powf(base, exponent[i]); base must be positive and finite.
+    // This experimental op accepts only contiguous F32 exponents and returns F32.
+    GGML_API struct ggml_tensor * ggml_pow_base_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * exponent,
+            float                 base);
 
     GGML_API struct ggml_tensor * ggml_add_cast(
             struct ggml_context * ctx,

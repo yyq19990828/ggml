@@ -27,6 +27,15 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __device__ __forceinline__ float op_div_rn_noftz(const float a, const float b) {
+    float result;
+    // Explicit RN division without .ftz, unaffected by this TU's -use_fast_math.
+    asm volatile("div.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
+}
+#endif
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -452,6 +461,12 @@ void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div_rn_noftz>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+        return;
+    }
+#endif
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 

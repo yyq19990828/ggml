@@ -6458,6 +6458,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;
     switch (op->op) {
+        case GGML_OP_POW_BASE_F32:
+            return false;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 ggml_type src0_type = op->src[0]->type;

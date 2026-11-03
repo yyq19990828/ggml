@@ -12,6 +12,30 @@
 #include <cfloat>
 #include <cmath>
 
+void ggml_compute_forward_fma(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * c = dst->src[2];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, c) && ggml_are_same_shape(a, dst));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c) && ggml_is_contiguous(dst));
+
+    const float * av = static_cast<const float *>(a->data);
+    const float * bv = static_cast<const float *>(b->data);
+    const float * cv = static_cast<const float *>(c->data);
+    float * out = static_cast<float *>(dst->data);
+    const int64_t n = ggml_nelements(dst);
+    const int64_t chunk = (n + params->nth - 1) / params->nth;
+    const int64_t begin = chunk * params->ith;
+    const int64_t end = std::min(begin + chunk, n);
+
+    for (int64_t i = begin; i < end; ++i) {
+        out[i] = std::fma(av[i], bv[i], cv[i]);
+    }
+}
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(

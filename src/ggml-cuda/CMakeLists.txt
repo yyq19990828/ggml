@@ -203,7 +203,10 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_CXX_FLAGS "")
 
-    set(CUDA_FLAGS -use_fast_math -extended-lambda)
+    # Keep the existing fast-math setting effective for every existing CUDA
+    # translation unit while allowing the persistent softmax TU to use its
+    # pinned non-fast-math arithmetic.
+    set(CUDA_FLAGS -extended-lambda)
 
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)
@@ -271,6 +274,26 @@ if (CUDAToolkit_FOUND)
     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
+
+    set(GGML_CUDA_FAST_MATH_SOURCES ${GGML_SOURCES_CUDA})
+    list(REMOVE_ITEM GGML_CUDA_FAST_MATH_SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu")
+    set_source_files_properties(${GGML_CUDA_FAST_MATH_SOURCES}
+                                PROPERTIES COMPILE_OPTIONS "-use_fast_math")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
+                            PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()

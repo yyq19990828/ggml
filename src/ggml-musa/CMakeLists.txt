@@ -30,6 +30,7 @@ if (MUSAToolkit_FOUND)
     list(APPEND GGML_HEADERS_MUSA "../ggml-musa/mudnn.cuh")
 
     file(GLOB   GGML_SOURCES_MUSA "../ggml-cuda/*.cu")
+    list(FILTER GGML_SOURCES_MUSA EXCLUDE REGEX "group-norm-affine\\.cu$")
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")

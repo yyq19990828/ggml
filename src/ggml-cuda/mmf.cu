@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "mmf.cuh"
+#include "mul-mat-reduction.cuh"
 #include "mmid.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
@@ -129,6 +130,79 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __device__ __forceinline__ float ggml_cuda_fma_rn_preserve_denormals(
+        const float a, const float b, const float accumulator) {
+    float result;
+    // Spell the non-FTZ instruction explicitly. The containing CUDA TU is built
+    // with --use_fast_math, so source-level fmaf alone is not the contract.
+    asm volatile("fma.rn.f32 %0, %1, %2, %3;"
+            : "=f"(result) : "f"(a), "f"(b), "f"(accumulator));
+    return result;
+}
+
+static __global__ void ggml_cuda_mul_mat_f32_canonical_k_kernel(
+        const float * __restrict__ src0,
+        const float * __restrict__ src1,
+        float * __restrict__ dst,
+        const int64_t K,
+        const int64_t O,
+        const int64_t P,
+        const int64_t stride_src0_row,
+        const int64_t stride_src1_row,
+        const int64_t stride_dst_row) {
+    const int64_t n_outputs = O * P;
+    for (int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+            index < n_outputs;
+            index += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t o = index % O;
+        const int64_t p = index / O;
+        const float * a_row = src0 + o * stride_src0_row;
+        const float * b_row = src1 + p * stride_src1_row;
+        float accumulator = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+            accumulator = ggml_cuda_fma_rn_preserve_denormals(a_row[k], b_row[k], accumulator);
+        }
+        dst[p * stride_dst_row + o] = accumulator;
+    }
+}
+
+void ggml_cuda_mul_mat_f32_canonical_k(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 != nullptr && src1 != nullptr && dst != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+    GGML_ASSERT(dst->ne[0] == src0->ne[1] && dst->ne[1] == src1->ne[1]);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[1] % sizeof(float) == 0 && src1->nb[1] % sizeof(float) == 0 &&
+            dst->nb[1] % sizeof(float) == 0);
+
+    const int64_t K = src0->ne[0];
+    const int64_t O = src0->ne[1];
+    const int64_t P = src1->ne[1];
+    const int64_t stride_src0_row = src0->nb[1] / sizeof(float);
+    const int64_t stride_src1_row = src1->nb[1] / sizeof(float);
+    const int64_t stride_dst_row  = dst->nb[1] / sizeof(float);
+    const int64_t n_outputs = O * P;
+    GGML_ASSERT(K > 0 && O > 0 && P > 0);
+    GGML_ASSERT(stride_src0_row >= K && stride_src1_row >= K && stride_dst_row >= O);
+
+    constexpr int threads = 256;
+    const int64_t needed_blocks = (n_outputs + threads - 1) / threads;
+    const int blocks = (int) (needed_blocks < 65535 ? needed_blocks : 65535);
+    ggml_cuda_mul_mat_f32_canonical_k_kernel<<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) src0->data,
+            (const float *) src1->data,
+            (float *) dst->data,
+            K, O, P,
+            stride_src0_row, stride_src1_row, stride_dst_row);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
         const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {

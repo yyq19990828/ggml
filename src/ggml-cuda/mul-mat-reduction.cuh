@@ -1,0 +1,10 @@
+#ifndef SAM_CPP_BUILD_GGML_ORDERED_F32_CONVOLUTION_PROTOTYPE_001_SOURCE_002_GGML_SRC_SRC_GGML_CUDA_MUL_MAT_REDUCTION_CUH
+#define SAM_CPP_BUILD_GGML_ORDERED_F32_CONVOLUTION_PROTOTYPE_001_SOURCE_002_GGML_SRC_SRC_GGML_CUDA_MUL_MAT_REDUCTION_CUH
+
+struct ggml_backend_cuda_context;
+struct ggml_tensor;
+
+void ggml_cuda_mul_mat_f32_canonical_k(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+#endif // SAM_CPP_BUILD_GGML_ORDERED_F32_CONVOLUTION_PROTOTYPE_001_SOURCE_002_GGML_SRC_SRC_GGML_CUDA_MUL_MAT_REDUCTION_CUH

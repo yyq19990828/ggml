@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "FMA",
+    "POW_BASE_F32",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "fma(x,y,z)",
+    "powf(base,x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2092,6 +2096,42 @@ struct ggml_tensor * ggml_add_inplace(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_add_impl(ctx, a, b, true);
+}
+
+// ggml_fma: explicit elementwise F32 fused multiply-add.
+struct ggml_tensor * ggml_fma(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(a != NULL && b != NULL && c != NULL);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, c));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+    result->op = GGML_OP_FMA;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    return result;
+}
+
+// ggml_pow_base_f32: elementwise powf(base, exponent[i]).
+struct ggml_tensor * ggml_pow_base_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * exponent,
+        float                 base) {
+    GGML_ASSERT(ctx != NULL && exponent != NULL);
+    GGML_ASSERT(isfinite(base) && base > 0.0f);
+    GGML_ASSERT(exponent->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(exponent));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, exponent);
+    result->op = GGML_OP_POW_BASE_F32;
+    result->src[0] = exponent;
+    ggml_set_op_params_f32(result, 0, base);
+    return result;
 }
 
 // ggml_add_cast

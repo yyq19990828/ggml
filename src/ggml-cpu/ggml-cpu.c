@@ -6,6 +6,7 @@
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "ggml-mul-mat-reduction.h"
 #include "quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -1758,6 +1759,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_add(params, tensor);
             } break;
+        case GGML_OP_FMA:
+            {
+                ggml_compute_forward_fma(params, tensor);
+            } break;
         case GGML_OP_ADD_ID:
             {
                 ggml_compute_forward_add_id(params, tensor);
@@ -1801,6 +1806,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_COS:
             {
                 ggml_compute_forward_cos(params, tensor);
+            } break;
+        case GGML_OP_POW_BASE_F32:
+            {
+                ggml_compute_forward_pow_base_f32(params, tensor);
             } break;
         case GGML_OP_SUM:
             {
@@ -1864,6 +1873,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
+                if (ggml_mul_mat_get_reduction_policy(tensor) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
+                    GGML_ABORT("CPU MUL_MAT does not implement the requested reduction policy");
+                }
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
@@ -2262,6 +2274,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:
+        case GGML_OP_FMA:
+        case GGML_OP_POW_BASE_F32:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:

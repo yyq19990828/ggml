@@ -6,6 +6,8 @@
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
 
+#include "ggml-mul-mat-reduction.h"
+
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
@@ -1553,6 +1555,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     }
 
     switch (op->op) {
+        case GGML_OP_POW_BASE_F32:
+            return false;
         case GGML_OP_SCALE:
         case GGML_OP_FILL:
         case GGML_OP_CLAMP:
@@ -1848,6 +1852,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
+            if (ggml_mul_mat_get_reduction_policy(op) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
+                return false;
+            }
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
             // still goes through ggml_metal_supports_mul_mat_op
             if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
