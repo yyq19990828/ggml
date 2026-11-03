@@ -1,12 +1,142 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
 // SAM's precise, bounded-workspace CUDA operators for pinned GGML.
 #include "sam-precise.cuh"
 
+#include <cmath>
+#include <cfloat>
 #include <algorithm>
 #include <climits>
 #include <cstdint>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Match SDPA math's operand-side scaling and block reduction order. The 5184
+// key DART rows use six registers per thread at 1024 threads, as in ATen's
+// cunn_SoftMaxForwardReg. Short rows use the same persistent warp ordering.
+__device__ __forceinline__ float sam_exp(float x) { return std::exp(x); }
+
+struct SamMax {
+    __device__ __forceinline__ float operator()(float a, float b) const { return a < b ? b : a; }
+    __device__ __forceinline__ float combine(float a, float b) const { return a < b ? b : a; }
+    __device__ __forceinline__ float warp_shfl_down(float v, int offset) const {
+        return __shfl_down_sync(0xffffffffu, v, offset);
+    }
+};
+struct SamAdd {
+    __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
+    __device__ __forceinline__ float combine(float a, float b) const { return a + b; }
+    __device__ __forceinline__ float warp_shfl_down(float v, int offset) const {
+        return __shfl_down_sync(0xffffffffu, v, offset);
+    }
+};
+template<class Op> __device__ __forceinline__ float sam_warp_reduce(float v, Op op) {
+    for (int offset = 16; offset; offset >>= 1) v = op.combine(v, op.warp_shfl_down(v, offset));
+    return v;
+}
+template<class Op> __device__ __forceinline__ float sam_block_reduce(
+        float v, Op op, float identity, float * shared) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    v = sam_warp_reduce(v, op);
+    __syncthreads();
+    if (!lane) shared[warp] = v;
+    __syncthreads();
+    v = threadIdx.x < (blockDim.x >> 5) ? shared[lane] : identity;
+    if (!warp) v = sam_warp_reduce(v, op);
+    if (threadIdx.x == 0) shared[0] = v;
+    __syncthreads();
+    return shared[0];
+}
+static __global__ void sam_attention_persistent_softmax(float * scores, const char * mask,
+        int keys, int first_query, size_t mask_row_stride, int first_head,
+        int mask_heads, size_t mask_head_stride, size_t score_head_stride) {
+    const int query = blockIdx.x;
+    float * row = scores + size_t(blockIdx.y) * score_head_stride + int64_t(query) * keys;
+    const half * mask_row = mask ? reinterpret_cast<const half *>(mask +
+        size_t(first_query + query) * mask_row_stride +
+        size_t((first_head + blockIdx.y) % mask_heads) * mask_head_stride) : nullptr;
+    float values[64];
+    float maximum = -FLT_MAX;
+    for (int i = 0; i < (keys + 31) / 32; ++i) {
+        const int key = threadIdx.x + i * 32;
+        values[i] = key < keys ? row[key] + (mask_row ? __half2float(mask_row[key]) : 0.0f) : -INFINITY;
+        maximum = SamMax{}(maximum, values[i]);
+    }
+    for (int offset = 16; offset; offset >>= 1) maximum = SamMax{}(maximum,
+        __shfl_xor_sync(0xffffffffu, maximum, offset, 32));
+    float sum = 0.0f;
+    for (int i = 0; i < (keys + 31) / 32; ++i) {
+        values[i] = sam_exp(values[i] - maximum);
+        sum += values[i];
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    for (int i = 0; i < (keys + 31) / 32; ++i) {
+        const int key = threadIdx.x + i * 32;
+        if (key < keys) row[key] = sum > 0.0f ? values[i] / sum : 0.0f;
+    }
+}
+
+
+template<int Regs> static __global__ void sam_attention_register_softmax(
+        float * scores, const char * mask, int keys, int first_query,
+        size_t mask_row_stride, int first_head, int mask_heads,
+        size_t mask_head_stride, size_t score_head_stride) {
+    const int query = blockIdx.x;
+    float * row = scores + size_t(blockIdx.y) * score_head_stride + int64_t(query) * keys;
+    const half * mask_row = mask ? reinterpret_cast<const half *>(mask +
+        size_t(first_query + query) * mask_row_stride +
+        size_t((first_head + blockIdx.y) % mask_heads) * mask_head_stride) : nullptr;
+    __shared__ float partial[32];
+    float values[Regs];
+    float local_max = -FLT_MAX;
+    #pragma unroll
+    for (int i = 0; i < Regs; ++i) {
+        const int key = threadIdx.x + i * blockDim.x;
+        if (key < keys) {
+            values[i] = row[key] + (mask_row ? __half2float(mask_row[key]) : 0.0f);
+            local_max = SamMax{}(local_max, values[i]);
+        } else values[i] = -INFINITY;
+    }
+    const float maximum = sam_block_reduce(local_max, SamMax{}, -FLT_MAX, partial);
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < Regs; ++i) {
+        const int key = threadIdx.x + i * blockDim.x;
+        if (key < keys) {
+            values[i] = sam_exp(values[i] - maximum);
+            local_sum += values[i];
+        }
+    }
+    const float sum = sam_block_reduce(local_sum, SamAdd{}, 0.0f, partial);
+    #pragma unroll
+    for (int i = 0; i < Regs; ++i) {
+        const int key = threadIdx.x + i * blockDim.x;
+        if (key < keys) row[key] = sum > 0.0f ? values[i] / sum : 0.0f;
+    }
+}
+
+static __global__ void sam_scale_k(const float * src, float * dst, int dimensions,
+        int keys, int heads, size_t key_stride, size_t head_stride, float factor) {
+    const int64_t count = int64_t(dimensions) * keys * heads;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+            i += int64_t(blockDim.x) * gridDim.x) {
+        const int d = int(i % dimensions);
+        const int key = int((i / dimensions) % keys);
+        const int head = int(i / (int64_t(dimensions) * keys));
+        dst[i] = src[size_t(head) * head_stride + size_t(key) * key_stride + d] * factor;
+    }
+}
+static __global__ void sam_scale_q(const float * src, float * dst, int dimensions,
+        int queries, int heads, size_t query_stride, size_t head_stride, float factor) {
+    const int64_t count = int64_t(dimensions) * queries * heads;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+            i += int64_t(blockDim.x) * gridDim.x) {
+        const int d = int(i % dimensions);
+        const int query = int((i / dimensions) % queries);
+        const int head = int(i / (int64_t(dimensions) * queries));
+        dst[i] = src[size_t(head) * head_stride + size_t(query) * query_stride + d] * factor;
+    }
+}
+
 static __global__ void sam_f32_short_dot_kernel(const float * lhs, const float * rhs,
                                                 float * dst, int k) {
     __shared__ double partial[256];
@@ -187,25 +317,40 @@ void ggml_cuda_sam_f32_attention(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const auto * mask = dst->src[3];
     const int dimensions = int(q->ne[0]);
     const int keys = int(k->ne[1]);
-    const int tile = int(std::min<int64_t>(q->ne[1], 1024));
-    const size_t score_head_stride = size_t(keys) * tile;
-    // Batch heads while keeping score scratch bounded by 32 MiB or one head.
-    // GQA retains its original head mapping and single-head workspace.
+    // Preserve head batches: single-head GEMM changes F32 reduction order.
+    // Shrink query tiles to bound scores by 32 MiB (or one key row).
     const size_t scratch_budget = 32 * 1024 * 1024;
+    const size_t row_bytes = size_t(keys) * sizeof(float);
     const int max_heads = q->ne[2] == k->ne[2]
         ? int(std::min<int64_t>({q->ne[2], 8,
-            int64_t(std::max<size_t>(1, scratch_budget / (score_head_stride * sizeof(float))))})) : 1;
+            int64_t(std::max<size_t>(1, scratch_budget / row_bytes))})) : 1;
+    const int tile = int(std::min<int64_t>({q->ne[1], 1024,
+        int64_t(std::max<size_t>(1, scratch_budget / (row_bytes * max_heads)))}));
+    const size_t score_head_stride = size_t(keys) * tile;
     ggml_cuda_pool_alloc<float> scores(ctx.pool(), score_head_stride * max_heads);
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
+    const float scale_factor = std::sqrt(std::fabs(scale));
+    const float key_scale_factor = scale_factor;
+    const float query_scale_factor = std::copysign(scale_factor, scale);
+    ggml_cuda_pool_alloc<float> scaled_keys(ctx.pool(), size_t(dimensions) * keys * k->ne[2]);
+    ggml_cuda_pool_alloc<float> scaled_queries(ctx.pool(), size_t(dimensions) * tile * max_heads);
     const float zero = 0.0f, one = 1.0f;
     const int64_t head_ratio = q->ne[2] / k->ne[2];
     const int64_t batch_ratio = q->ne[3] / k->ne[3];
     for (int64_t batch = 0; batch < q->ne[3]; ++batch) {
+        if (batch == 0 || (k->nb[3] != 0 && batch % batch_ratio == 0)) {
+            const int64_t kv_batch = batch / batch_ratio;
+            const char * raw_keys = (const char *) k->data + kv_batch * k->nb[3];
+            const int64_t key_count = int64_t(dimensions) * keys * k->ne[2];
+            sam_scale_k<<<unsigned(std::min<int64_t>((key_count + 255) / 256, 65535)), 256, 0, ctx.stream()>>>(
+                (const float *) raw_keys, scaled_keys.get(), dimensions, keys, int(k->ne[2]),
+                int(k->nb[1] / sizeof(float)), int(k->nb[2] / sizeof(float)), key_scale_factor);
+            CUDA_CHECK(cudaGetLastError());
+        }
         for (int64_t head = 0; head < q->ne[2]; head += max_heads) {
             const int heads = int(std::min<int64_t>(max_heads, q->ne[2] - head));
-            const char * key_data = (const char *) k->data + (batch / batch_ratio) * k->nb[3] +
-                (head / head_ratio) * k->nb[2];
+            const float * key_data = scaled_keys.get() + size_t(head / head_ratio) * dimensions * keys;
             const char * value_data = (const char *) v->data + (batch / batch_ratio) * v->nb[3] +
                 (head / head_ratio) * v->nb[2];
             const char * mask_data = mask ? (const char *) mask->data +
@@ -213,19 +358,38 @@ void ggml_cuda_sam_f32_attention(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t first = 0; first < q->ne[1]; first += tile) {
                 const int queries = int(std::min<int64_t>(tile, q->ne[1] - first));
                 const char * query_data = (const char *) q->data + batch * q->nb[3] + head * q->nb[2] + first * q->nb[1];
+                const int64_t query_count = int64_t(dimensions) * queries * heads;
+                float * query_pack = scaled_queries.get();
+                sam_scale_q<<<unsigned(std::min<int64_t>((query_count + 255) / 256, 65535)), 256, 0, ctx.stream()>>>(
+                    (const float *) query_data, query_pack, dimensions, queries, heads,
+                    int(q->nb[1] / sizeof(float)), int(q->nb[2] / sizeof(float)), query_scale_factor);
+                CUDA_CHECK(cudaGetLastError());
                 if (heads == 1) {
                     CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                        keys, queries, dimensions, &scale, key_data, CUDA_R_32F, int(k->nb[1] / sizeof(float)),
-                        query_data, CUDA_R_32F, int(q->nb[1] / sizeof(float)), &zero,
+                        keys, queries, dimensions, &one, key_data, CUDA_R_32F, dimensions,
+                        query_pack, CUDA_R_32F, dimensions, &zero,
                         scores.get(), CUDA_R_32F, keys, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 } else {
                     CUBLAS_CHECK(cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                        keys, queries, dimensions, &scale, key_data, CUDA_R_32F, int(k->nb[1] / sizeof(float)), k->nb[2] / sizeof(float),
-                        query_data, CUDA_R_32F, int(q->nb[1] / sizeof(float)), q->nb[2] / sizeof(float), &zero,
+                        keys, queries, dimensions, &one, key_data, CUDA_R_32F, dimensions, size_t(dimensions) * keys,
+                        query_pack, CUDA_R_32F, dimensions, size_t(dimensions) * queries, &zero,
                         scores.get(), CUDA_R_32F, keys, score_head_stride, heads,
                         CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 }
-                sam_attention_softmax<<<dim3(queries, heads), 256, 0, ctx.stream()>>>(scores.get(), mask_data,
+                const dim3 softmax_grid(queries, heads);
+                if (keys <= 2048) {
+                    sam_attention_persistent_softmax<<<softmax_grid, 32, 0, ctx.stream()>>>(scores.get(), mask_data,
+                        keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1,
+                        mask ? mask->nb[2] : 0, score_head_stride);
+                } else if (keys <= 9216) {
+                    if (keys <= 3072) sam_attention_register_softmax<3><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else if (keys <= 4096) sam_attention_register_softmax<4><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else if (keys <= 5120) sam_attention_register_softmax<5><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else if (keys <= 6144) sam_attention_register_softmax<6><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else if (keys <= 7168) sam_attention_register_softmax<7><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else if (keys <= 8192) sam_attention_register_softmax<8><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                    else sam_attention_register_softmax<9><<<softmax_grid, 1024, 0, ctx.stream()>>>(scores.get(), mask_data, keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1, mask ? mask->nb[2] : 0, score_head_stride);
+                } else sam_attention_softmax<<<softmax_grid, 256, 0, ctx.stream()>>>(scores.get(), mask_data,
                     keys, int(first), mask ? mask->nb[1] : 0, int(head), mask ? int(mask->ne[2]) : 1,
                     mask ? mask->nb[2] : 0, score_head_stride);
                 CUDA_CHECK(cudaGetLastError());

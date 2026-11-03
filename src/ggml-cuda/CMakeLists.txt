@@ -279,6 +279,7 @@ if (CUDAToolkit_FOUND)
     list(REMOVE_ITEM GGML_CUDA_FAST_MATH_SOURCES
          "${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/sam-precise.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/softmax-wide-order.cu"
          "${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
@@ -290,6 +291,8 @@ if (CUDAToolkit_FOUND)
                                 PROPERTIES COMPILE_OPTIONS "-use_fast_math")
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/sam-precise.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
                                 PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
