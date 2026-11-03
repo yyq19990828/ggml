@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-mul-mat-reduction.h"
+#include "ggml-cuda/ggml-cuda-mul-mat-add-view-fusion.cuh"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -5161,6 +5162,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // mul_mat + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+
+#if defined(GGML_CUDA_USE_CUBLASLT_BIAS_FUSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (op == GGML_OP_MUL_MAT && bias_op == GGML_OP_ADD) {
+            ggml_cuda_mul_mat_add_view_fusion::Match match{};
+            const auto is_immutable_weight = [](const ggml_tensor * tensor) {
+                return tensor != nullptr && tensor->buffer != nullptr &&
+                       ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                       (tensor->flags & GGML_TENSOR_FLAG_PARAM) == 0;
+            };
+            if (ggml_cuda_mul_mat_add_view_fusion::match(cgraph, i, is_immutable_weight, &match)) {
+                ggml_tensor * add_node = cgraph->nodes[match.add_index];
+                if (!ggml_are_same_shape(add_node->src[0], add_node->src[1])) {
+                    const int output_nodes[] = { match.add_index };
+                    const int node_count = match.add_index - i + 1;
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, node_count, output_nodes, 1) &&
+                            ggml_cuda_lt_ranges_disjoint(add_node, match.bias_base) &&
+                            ggml_cuda_try_fuse_mul_mat_add_lt(*cuda_ctx, cgraph->nodes[i],
+                                                              match.bias, add_node)) {
+                        return node_count - 1;
+                    }
+                }
+            }
+        }
+#endif
 
         if (!ggml_cuda_fusion_window_uses_only_default_reduction(cgraph, i, { op, bias_op }) ||
                 !ggml_can_fuse(cgraph, i, { op, bias_op })) {
