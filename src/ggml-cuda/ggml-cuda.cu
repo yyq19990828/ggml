@@ -26,6 +26,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/sam-precise.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -1499,6 +1500,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     size_t nbd3 = dst->nb[3];
 
     cublasComputeType_t cu_compute_type = traits::compute_type;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const bool precise_f32 = compute_type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_F32;
+    if (precise_f32) cu_compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
+#else
+    const bool precise_f32 = false;
+#endif
     cudaDataType_t cu_data_type = traits::data_type;
     cudaDataType_t cu_data_type_a = traits::data_type;
     cudaDataType_t cu_data_type_b = traits::data_type;
@@ -1508,7 +1515,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        prefer_f32_output = (dst->op_params[0] == GGML_PREC_F32 && dst->op_params[3] == GGML_PREC_F16) ||
+            cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -1539,7 +1547,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (compute_type == GGML_TYPE_F32 && !precise_f32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -1638,11 +1646,17 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     if (prec == GGML_PREC_BF16 && compute_type == GGML_TYPE_F16) {
         compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     } else if (prec == GGML_PREC_F32) {
-        compute_type = GGML_TYPE_F32;
+        // Explicit reduced operands retain the F32 accumulator/output contract.
+        compute_type = dst->op_params[3] == GGML_PREC_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     }
 
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-    if (env_c != nullptr) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const bool allow_compute_override = prec != GGML_PREC_F32;
+#else
+    const bool allow_compute_override = true;
+#endif
+    if (env_c != nullptr && allow_compute_override) {
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
             c = std::tolower(c);
@@ -1878,6 +1892,16 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // The custom tensor-core MMF path stages dense operands at reduced precision.
+    // An explicit F32 request must preserve F32 activations and stored F16 values.
+    if (dst->op_params[0] == GGML_PREC_F32 &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+#endif
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -2422,6 +2446,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
+            break;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            ggml_cuda_sam_window(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
@@ -5710,6 +5738,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            return ggml_cuda_sam_window_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

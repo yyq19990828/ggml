@@ -511,7 +511,8 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    // Fast division can flush the inverse of a large finite value to zero.
+    const float d_inv = __fdiv_rn(127.0f, amax);
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
