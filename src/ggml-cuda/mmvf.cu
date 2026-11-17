@@ -708,8 +708,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 || (uintptr_t) src0->data % alignof(uint16_t) == 0);
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    // the fused GLU path gets the GLU node as dst, which carries no matmul precision, so it accumulates in F32
-    const enum ggml_prec prec = fast_fp16_available(cc) && !(fusion && fusion->gate) ? ggml_prec_get_acc(dst) : GGML_PREC_F32;
+    // A fused ADD/GLU destination has no matmul precision slot. Bias-only
+    // fusion carries the original hint; gated fusion retains its F32 policy.
+    const enum ggml_prec requested_prec = fusion ? fusion->prec_acc : ggml_prec_get_acc(dst);
+    const enum ggml_prec prec = fast_fp16_available(cc) && !(fusion && fusion->gate) ? requested_prec : GGML_PREC_F32;
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

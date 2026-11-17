@@ -1563,6 +1563,7 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
     ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
+    ggml_prec prec_acc = GGML_PREC_UNDEFINED; // accumulator precision of the original fused MUL_MAT
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;

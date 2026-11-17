@@ -2305,6 +2305,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
          src0->type == GGML_TYPE_F8_E4M3) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
+    // MMVF cannot round operands to F16 while retaining F32 accumulation.
+    // Leave explicit reduced-input requests to the precise cuBLAS dispatcher.
+    if (tensor->op == GGML_OP_MUL_MAT &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+            ggml_prec_get_acc(tensor) == GGML_PREC_F32 &&
+            (ggml_prec_get_src(tensor, 1) == GGML_PREC_F16 ||
+             (gate && ggml_prec_get_src(gate, 1) == GGML_PREC_F16))) {
+        return false;
+    }
+
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0, cc, warp_size, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
@@ -6205,6 +6215,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
+        fusion_data.prec_acc = ggml_prec_get_acc(mm_node);
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
