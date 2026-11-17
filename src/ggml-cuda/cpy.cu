@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include <type_traits>
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -39,6 +40,26 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
 
     ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
+// A contiguous destination only needs the source coordinates. Bounds keep
+// fastdiv's intermediate addition within uint32_t; byte strides stay 64-bit.
+template <typename src_t, typename dst_t>
+static __global__ void sam_cpy_contiguous_dst(const char * src, dst_t * dst, uint32_t ne,
+        uint3 ne0, uint3 ne01, uint3 ne012,
+        size_t nb0, size_t nb1, size_t nb2, size_t nb3) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ne) return;
+    const uint32_t i3 = fastdiv(i, ne012);
+    const uint32_t r3 = i - i3 * ne012.z;
+    const uint32_t i2 = fastdiv(r3, ne01);
+    const uint32_t r2 = r3 - i2 * ne01.z;
+    const uint32_t i1 = fastdiv(r2, ne0);
+    const uint32_t i0 = r2 - i1 * ne0.z;
+    const size_t offset = size_t(i0)*nb0 + size_t(i1)*nb1 + size_t(i2)*nb2 + size_t(i3)*nb3;
+    ggml_cuda_pdl_sync();
+    dst[i] = ggml_cuda_cast<dst_t>(*reinterpret_cast<const src_t *>(src + offset));
 }
 
 template <typename T>
@@ -209,6 +230,15 @@ static void ggml_cpy_scalar_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     const auto launch_scalar_generic = [&]() {
+        if (ne <= INT32_MAX && nb10 == sizeof(dst_t) && nb11 == ne10 * sizeof(dst_t) &&
+                nb12 == ne10 * ne11 * sizeof(dst_t) && nb13 == ne10 * ne11 * ne12 * sizeof(dst_t)) {
+            const ggml_cuda_kernel_launch_params params((ne + 255) / 256, 256, 0, stream);
+            ggml_cuda_kernel_launch(sam_cpy_contiguous_dst<src_t, dst_t>, params, cx,
+                reinterpret_cast<dst_t *>(cdst), uint32_t(ne), init_fastdiv_values(ne00),
+                init_fastdiv_values(ne00 * ne01), init_fastdiv_values(ne00 * ne01 * ne02),
+                size_t(nb00), size_t(nb01), size_t(nb02), size_t(nb03));
+            return;
+        }
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
@@ -243,6 +273,43 @@ static void ggml_cpy_scalar_cuda(
                 cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
         }
     } else {
+        if constexpr (std::is_same<src_t, dst_t>::value) {
+            // Recognize two contiguous groups exchanged in physical storage.
+            // Remaining outer dimensions are independent dense matrices.
+            const int64_t dims[] = {ne00, ne01, ne02, ne / (ne00 * ne01 * ne02)};
+            const int64_t strides[] = {nb00, nb01, nb02, nb03};
+            const bool dense_dst = nb10 == sizeof(dst_t) && nb11 == ne10 * sizeof(dst_t) &&
+                nb12 == ne10 * ne11 * sizeof(dst_t) && nb13 == ne10 * ne11 * ne12 * sizeof(dst_t);
+            if (dense_dst) for (int split = 1; split < 4; ++split) for (int end = split + 1; end <= 4; ++end) {
+                int64_t a = 1, b = 1;
+                for (int d = 0; d < split; ++d) a *= dims[d];
+                for (int d = split; d < end; ++d) b *= dims[d];
+                const int64_t batches = ne / (a * b);
+                bool matches = true;
+                int64_t stride = b * sizeof(src_t);
+                for (int d = 0; d < split; ++d) {
+                    if (dims[d] > 1 && strides[d] != stride) matches = false;
+                    stride *= dims[d];
+                }
+                stride = sizeof(src_t);
+                for (int d = split; d < end; ++d) {
+                    if (dims[d] > 1 && strides[d] != stride) matches = false;
+                    stride *= dims[d];
+                }
+                stride = a * b * sizeof(src_t);
+                for (int d = end; d < 4; ++d) {
+                    if (dims[d] > 1 && strides[d] != stride) matches = false;
+                    stride *= dims[d];
+                }
+                const int64_t gx = (b + 31) / 32, gy = (a + 31) / 32, gz = (batches + 7) / 8;
+                if (!matches || a < 32 || b < 32 || gx > INT_MAX || gy > USHRT_MAX || gz > USHRT_MAX) continue;
+                const ggml_cuda_kernel_launch_params params(dim3(gx, gy, gz), dim3(32, 8, 1), 0, stream);
+                ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, params,
+                    cx, cdst, ne, a, b, batches, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+                return;
+            }
+        }
         launch_scalar_generic();
     }
 }

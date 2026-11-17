@@ -1002,3 +1002,107 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
 
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
+
+// window partitioning: contiguous [C, W, H] -> [C, w, w, npx*npy] with zero-padded edge windows
+kernel void kernel_win_part_f32(
+    constant ggml_metal_kargs_win_part & args,
+    device const char * src0,
+    device       char * dst,
+    uint gid[[thread_position_in_grid]]) {
+
+    const int64_t np = (int64_t)args.npx * args.npy;
+    const int64_t total = args.ne0 * args.ne1 * args.ne2 * np;
+
+    if ((int64_t)gid >= total) return;
+
+    // flat output index -> (i0, i1, i2, i3) for [ne0, w, w, np]
+    const int64_t i0   = gid % args.ne0;
+    const int64_t rem1 = gid / args.ne0;
+    const int64_t i1   = rem1 % args.ne1;
+    const int64_t rem2 = rem1 / args.ne1;
+    const int64_t i2   = rem2 % args.ne2;
+    const int64_t i3   = rem2 / args.ne2;
+
+    // window grid coordinates
+    const int64_t py = i3 / args.npx;
+    const int64_t px = i3 % args.npx;
+
+    // map to source coordinates
+    const int64_t src_col = px * args.w + i1;
+    const int64_t src_row = py * args.w + i2;
+
+    device float * dst_ptr = (device float *)(dst + (i3 * args.ne2 * args.ne1 * args.ne0
+                                                   + i2 * args.ne1 * args.ne0
+                                                   + i1 * args.ne0) * sizeof(float));
+
+    if (src_col >= args.ne01 || src_row >= args.ne02) {
+        dst_ptr[i0] = 0.0f;
+    } else {
+        device const float * src_ptr = (device const float *)(src0 + src_row * args.nb02 + src_col * args.nb01);
+        dst_ptr[i0] = src_ptr[i0];
+    }
+}
+
+// window restoration: [C, w, w, np] -> contiguous [C, w0, h0], dropping the window padding
+kernel void kernel_win_unpart_f32(
+    constant ggml_metal_kargs_win_unpart & args,
+    device const char * src0,
+    device       char * dst,
+    uint gid[[thread_position_in_grid]]) {
+
+    const int64_t total = args.ne0 * args.ne1 * args.ne2;
+
+    if ((int64_t)gid >= total) return;
+
+    // flat output index -> (i0, i1, i2) for [ne0, w0, h0]
+    const int64_t i0  = gid % args.ne0;
+    const int64_t rem = gid / args.ne0;
+    const int64_t i1  = rem % args.ne1;
+    const int64_t i2  = rem / args.ne1;
+
+    // window of this output element and the position inside it
+    const int64_t px = i1 / args.w;
+    const int64_t py = i2 / args.w;
+    const int64_t wx = i1 % args.w;
+    const int64_t wy = i2 % args.w;
+
+    const int64_t win_idx = py * args.npx + px;
+
+    device const float * src_ptr = (device const float *)(src0 + win_idx * args.nb03
+                                                               + wy * args.nb02
+                                                               + wx * args.nb01);
+
+    device float * dst_ptr = (device float *)(dst + (i2 * args.ne1 * args.ne0
+                                                   + i1 * args.ne0) * sizeof(float));
+
+    dst_ptr[i0] = src_ptr[i0];
+}
+
+// elementwise F32 fused multiply-add; b and c follow GGML's repeat rules and may be strided
+kernel void kernel_fma_f32(
+    constant ggml_metal_kargs_fma & args,
+    device const char * a,
+    device const char * b,
+    device const char * c,
+    device       char * dst,
+    uint gid[[thread_position_in_grid]]) {
+    const int64_t total = args.ne[0] * args.ne[1] * args.ne[2] * args.ne[3];
+    if ((int64_t) gid >= total) return;
+
+    int64_t q = gid;
+    int64_t off[3] = { 0, 0, 0 };
+    for (int d = 0; d < 4; ++d) {
+        const int64_t coord = q % args.ne[d];
+        q /= args.ne[d];
+        for (int k = 0; k < 3; ++k) {
+            off[k] += (coord % args.src_ne[k*4 + d]) * args.src_nb[k*4 + d];
+        }
+    }
+
+    device const float * ap = (device const float *)(a + off[0]);
+    device const float * bp = (device const float *)(b + off[1]);
+    device const float * cp = (device const float *)(c + off[2]);
+    device float * out = (device float *) dst;
+
+    out[gid] = fma(ap[0], bp[0], cp[0]);
+}

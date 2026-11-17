@@ -500,7 +500,8 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    const float d_inv = 127.0f / amax;
+    // Fast division can flush the inverse of a large finite value to zero.
+    const float d_inv = __fdiv_rn(127.0f, amax);
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
@@ -623,7 +624,9 @@ static __global__ void quantize_mmq_few_q8_1(
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    const float d_inv = 127.0f / amax;
+    // Fast division can flush the inverse of a large finite value to zero.
+    // v1's few-row MMQ path stages Q8_1 as well, so it keeps the same rule.
+    const float d_inv = __fdiv_rn(127.0f, amax);
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);

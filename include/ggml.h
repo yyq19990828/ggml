@@ -429,6 +429,15 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Elementwise F32 fused multiply-add.
+        GGML_OP_FMA,
+
+        // Local experiment: powf(positive_finite_base, contiguous_F32_exponent).
+        GGML_OP_POW_BASE_F32,
+
+        // CUDA-only F32 multi-scale deformable attention.
+        GGML_OP_MS_DEFORM_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -456,6 +465,7 @@ extern "C" {
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
 
+        GGML_UNARY_OP_LOG2,
         GGML_UNARY_OP_COUNT,
     };
 
@@ -742,6 +752,24 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Elementwise correctly-rounded F32 fused multiply-add: a * b + c.
+    // `a` defines the output shape. `b` and `c` must be F32 tensors repeatable
+    // to `a`; all three inputs may use arbitrary byte strides, including zero
+    // strides. The result is a new contiguous F32 tensor.
+#define GGML_FMA_LAYOUT_VERSION 1
+    GGML_API struct ggml_tensor * ggml_fma(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
+    // Elementwise powf(base, exponent[i]); base must be positive and finite.
+    // This experimental op accepts only contiguous F32 exponents and returns F32.
+    GGML_API struct ggml_tensor * ggml_pow_base_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * exponent,
+            float                 base);
+
     GGML_API struct ggml_tensor * ggml_add_cast(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -828,6 +856,12 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_log_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // Dense contiguous F32 native base-two logarithm.
+#define GGML_LOG2_VERSION 1
+    GGML_API struct ggml_tensor * ggml_log2(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 

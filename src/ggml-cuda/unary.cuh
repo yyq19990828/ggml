@@ -61,6 +61,8 @@ void ggml_cuda_op_cos(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_log(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_log2(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

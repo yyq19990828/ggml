@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-ms-deform-attn.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -1112,9 +1113,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "FMA",
+    "POW_BASE_F32",
+    "MS_DEFORM_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1229,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "fma(x,y,z)",
+    "powf(base,x)",
+    "ms_deform_attn(values, shapes, starts, locations, weights)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1254,9 +1261,10 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "LOG2",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 23, "GGML_UNARY_OP_COUNT != 23");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -2106,6 +2114,41 @@ struct ggml_tensor * ggml_add_inplace(
     return ggml_add_impl(ctx, a, b, true);
 }
 
+// ggml_fma: explicit elementwise F32 fused multiply-add.
+struct ggml_tensor * ggml_fma(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(a != NULL && b != NULL && c != NULL);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_repeat(b, a) && ggml_can_repeat(c, a));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+    result->op = GGML_OP_FMA;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    return result;
+}
+
+// ggml_pow_base_f32: elementwise powf(base, exponent[i]).
+struct ggml_tensor * ggml_pow_base_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * exponent,
+        float                 base) {
+    GGML_ASSERT(ctx != NULL && exponent != NULL);
+    GGML_ASSERT(isfinite(base) && base > 0.0f);
+    GGML_ASSERT(exponent->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(exponent));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, exponent);
+    result->op = GGML_OP_POW_BASE_F32;
+    result->src[0] = exponent;
+    ggml_set_op_params_f32(result, 0, base);
+    return result;
+}
+
 // ggml_add_cast
 
 static struct ggml_tensor * ggml_add_cast_impl(
@@ -2884,6 +2927,11 @@ struct ggml_tensor * ggml_exp(
     return ggml_unary(ctx, a, GGML_UNARY_OP_EXP);
 }
 
+struct ggml_tensor * ggml_log2(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    return ggml_unary(ctx, a, GGML_UNARY_OP_LOG2);
+}
+
 struct ggml_tensor * ggml_exp_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
@@ -3233,6 +3281,59 @@ struct ggml_tensor * ggml_group_norm_inplace(
         int                   n_groups,
         float                 eps) {
     return ggml_group_norm_impl(ctx, a, n_groups, eps, true);
+}
+
+struct ggml_tensor * ggml_ms_deform_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor * values,
+        struct ggml_tensor * spatial_shapes,
+        struct ggml_tensor * level_start_index,
+        struct ggml_tensor * sampling_locations,
+        struct ggml_tensor * attention_weights) {
+    GGML_ASSERT(ctx != NULL && values != NULL && spatial_shapes != NULL && level_start_index != NULL &&
+        sampling_locations != NULL && attention_weights != NULL);
+    GGML_ASSERT(values->type == GGML_TYPE_F32 && sampling_locations->type == GGML_TYPE_F32 &&
+        attention_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(spatial_shapes->type == GGML_TYPE_I32 && level_start_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(values) && ggml_is_contiguous(spatial_shapes) &&
+        ggml_is_contiguous(level_start_index) && ggml_is_contiguous(sampling_locations) &&
+        ggml_is_contiguous(attention_weights));
+
+    const int64_t channels = values->ne[0];
+    const int64_t heads = values->ne[1];
+    const int64_t spatial_size = values->ne[2];
+    const int64_t batch = values->ne[3];
+    const int64_t points = sampling_locations->ne[1];
+    const int64_t levels = spatial_shapes->ne[1];
+
+    GGML_ASSERT(channels > 0 && heads > 0 && spatial_size > 0 && batch > 0 && points > 0 && levels > 0);
+    GGML_ASSERT(spatial_shapes->ne[0] == 2 && spatial_shapes->ne[2] == 1 && spatial_shapes->ne[3] == 1);
+    GGML_ASSERT(level_start_index->ne[0] == levels && level_start_index->ne[1] == 1 &&
+        level_start_index->ne[2] == 1 && level_start_index->ne[3] == 1);
+    GGML_ASSERT(sampling_locations->ne[0] == 2 && sampling_locations->ne[2] == levels &&
+        sampling_locations->ne[3] > 0);
+    GGML_ASSERT(attention_weights->ne[0] == points && attention_weights->ne[1] == levels &&
+        attention_weights->ne[2] == heads && attention_weights->ne[3] > 0);
+    GGML_ASSERT(attention_weights->ne[3] % batch == 0);
+
+    const int64_t queries = attention_weights->ne[3] / batch;
+    GGML_ASSERT(queries > 0 && heads <= INT64_MAX / queries);
+    const int64_t heads_queries = heads * queries;
+    GGML_ASSERT(heads_queries <= INT64_MAX / batch);
+    const int64_t row_count = heads_queries * batch;
+    GGML_ASSERT(sampling_locations->ne[3] == row_count);
+    GGML_ASSERT(attention_weights->ne[3] == queries * batch);
+    GGML_ASSERT(row_count <= INT64_MAX / channels);
+
+    const int64_t ne[4] = { channels, heads, queries, batch };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_MS_DEFORM_ATTN;
+    result->src[0] = values;
+    result->src[1] = spatial_shapes;
+    result->src[2] = level_start_index;
+    result->src[3] = sampling_locations;
+    result->src[4] = attention_weights;
+    return result;
 }
 
 // ggml_l2_norm
@@ -7124,6 +7225,12 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_EXP: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
+                    }
+                } break;
+                case GGML_UNARY_OP_LOG2: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                                ggml_scale(ctx, ggml_div(ctx, grad, src0), 1.4426950408889634f));
                     }
                 } break;
                 case GGML_UNARY_OP_EXPM1: {

@@ -6,6 +6,8 @@
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
 
+#include "ggml-mul-mat-reduction.h"
+
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
@@ -1514,7 +1516,10 @@ static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op,
     const enum ggml_prec prec = ggml_prec_get_src(op, 1);
 
     if (prec == GGML_PREC_F32) {
-        return false;
+        // explicit F32 src1 is handled by the _prec_f32 dense kernels, or by the
+        // few-row MMA and mat-vec kernels that already read src1 as float
+        // other left operand types, src1 types and non-MUL_MAT ops keep the upstream rejection
+        return ggml_metal_op_mul_mat_prec_f32(op);
     }
     if (prec == GGML_PREC_BF16) {
         return has_tensor && op->op == GGML_OP_MUL_MAT && op->src[0]->type != GGML_TYPE_F32;
@@ -1567,6 +1572,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     }
 
     switch (op->op) {
+        // CUDA-only and unsupported fork extensions
+        case GGML_OP_POW_BASE_F32:
+        case GGML_OP_MS_DEFORM_ATTN:
+            return false;
         case GGML_OP_SCALE:
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16);
         case GGML_OP_FILL:
@@ -1579,6 +1588,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_LOG2:
+                    // native precise::log2 over contiguous F32 tensors with the same shape
+                    return op->src[0] != NULL && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(op->src[0], op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                        ggml_nelements(op) <= INT32_MAX;
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
@@ -1730,6 +1744,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            // both kernels use a flat uint grid and contiguous F32 channel vectors
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) < (1LL << 31);
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_TIMESTEP_EMBEDDING:
@@ -1905,7 +1925,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_FMA:
+            // contiguous F32 output, a-shaped: b and c follow the repeat rules and may be strided
+            return op->type == GGML_TYPE_F32 && op->src[0] && op->src[1] && op->src[2] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(op->src[0], op) && ggml_can_repeat(op->src[1], op) && ggml_can_repeat(op->src[2], op) &&
+                ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_MUL_MAT:
+            // the canonical-K FMA reduction order is not implemented here; fail closed instead of substituting another order
+            if (ggml_mul_mat_get_reduction_policy(op) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
+                return false;
+            }
             if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
                 return false;
             }

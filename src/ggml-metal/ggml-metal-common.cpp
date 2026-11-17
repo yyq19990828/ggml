@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cassert>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -47,6 +48,39 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne21 = op->src[2]->ne[1];
 
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+}
+
+// the explicit F32 hints covered by the precise dense kernels: F32/F16 weights by F32 activations
+// - the accumulator hint alone keeps the previous contract for the same operand pair
+// - a src1 hint is only satisfiable when src1 is already F32 and the kernels stage it as float
+// - quantized, BF16 and F16 src1 operands keep the upstream dispatch (and the upstream src1 rejection)
+bool ggml_metal_op_mul_mat_prec_f32(const struct ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    if (op->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const bool acc_f32  = ggml_prec_get_acc(op)    == GGML_PREC_F32;
+    const bool src1_f32 = ggml_prec_get_src(op, 1) == GGML_PREC_F32;
+
+    return (acc_f32 || src1_f32) &&
+        (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+}
+
+// the precise kernel is instantiated for equal 32- and 64-dimensional K/V heads only
+// wider heads would exceed the threadgroup limit with a float Query, so they keep the upstream half-Query kernel
+bool ggml_metal_op_flash_attn_ext_use_prec_f32(const struct ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+
+    return ggml_prec_get_acc(op) == GGML_PREC_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        dk == dv && (dk == 32 || dk == 64);
 }
 
 // the most src1 rows of the few-row MMA kernels

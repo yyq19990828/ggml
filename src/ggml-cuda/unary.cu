@@ -1,6 +1,14 @@
 #include "unary.cuh"
 #include "convert.cuh"
 
+void ggml_cuda_op_sin_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_cos_f32_nonfast(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_op_log_f32_precise(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_sigmoid_f32_precise(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_log2_f32_precise(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#endif
+
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
 }
@@ -84,6 +92,10 @@ static __device__ __forceinline__ float op_cos(float x) {
 
 static __device__ __forceinline__ float op_log(float x) {
     return logf(x);
+}
+
+static __device__ __forceinline__ float op_log2(float x) {
+    return log2f(x);
 }
 
 static __device__ __forceinline__ float op_expm1(float x) {
@@ -239,6 +251,12 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_sigmoid_f32_precise(ctx, dst);
+        return;
+    }
+#endif
     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
 }
 
@@ -263,15 +281,37 @@ void ggml_cuda_op_sqrt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_sin(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_unary<op_sin>(ctx, dst);
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_sin_f32_nonfast(ctx, dst);
+    } else {
+        ggml_cuda_op_unary<op_sin>(ctx, dst);
+    }
 }
 
 void ggml_cuda_op_cos(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_unary<op_cos>(ctx, dst);
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_cos_f32_nonfast(ctx, dst);
+    } else {
+        ggml_cuda_op_unary<op_cos>(ctx, dst);
+    }
 }
 
 void ggml_cuda_op_log(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->src[0]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_log_f32_precise(ctx, dst);
+        return;
+    }
+#endif
     ggml_cuda_op_unary<op_log>(ctx, dst);
+}
+
+void ggml_cuda_op_log2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_op_log2_f32_precise(ctx, dst);
+#else
+    ggml_cuda_op_unary<op_log2>(ctx, dst);
+#endif
 }
 
 void ggml_cuda_op_elu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

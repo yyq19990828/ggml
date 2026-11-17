@@ -55,6 +55,15 @@ bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_t
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
+// explicit F32 precision on the dense MUL_MAT path
+// - selects the _prec_f32 kernels, which stage both operands and the 8x8 matrix fragments in float
+// - the explicit accumulator or src[1] hint also has to be honoured by the few-row MMA and mat-vec paths,
+//   which already read src1 as float, so supports_op and the pipeline dispatch ask this same question
+bool ggml_metal_op_mul_mat_prec_f32(const struct ggml_tensor * op);
+
+// flash attention keeps Query in float only for the instantiated precise specializations
+bool ggml_metal_op_flash_attn_ext_use_prec_f32(const struct ggml_tensor * op);
+
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only
 

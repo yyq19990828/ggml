@@ -6,6 +6,7 @@
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "ggml-mul-mat-reduction.h"
 #include "quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -1169,6 +1170,31 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+
+// Opt-in process-local diagnostics. The idle-only installation contract keeps
+// callback/user coherent; atomics provide a cheap normal-path enabled check.
+static ggml_cpu_sam_observer sam_observer_callback = NULL;
+static void * sam_observer_user = NULL;
+static atomic_bool sam_observer_active = false;
+
+void ggml_cpu_sam_set_observer(ggml_cpu_sam_observer callback, void * user) {
+    atomic_store_explicit(&sam_observer_active, false, memory_order_release);
+    sam_observer_user = user;
+    sam_observer_callback = callback;
+    atomic_store_explicit(&sam_observer_active, callback != NULL, memory_order_release);
+}
+
+bool ggml_cpu_sam_observer_enabled(void) {
+    return atomic_load_explicit(&sam_observer_active, memory_order_acquire);
+}
+
+void ggml_cpu_sam_observe(const struct ggml_tensor * dst,
+        const char * phase, const char * path, enum ggml_type rhs_type,
+        const void * scratch, size_t scratch_bytes, int64_t wall_us) {
+    if (ggml_cpu_sam_observer_enabled())
+        sam_observer_callback(dst, phase, path, rhs_type, scratch, scratch_bytes, wall_us, sam_observer_user);
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1337,6 +1363,10 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
+    const bool sam_capture = ggml_cpu_sam_observer_enabled() &&
+        ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+    const int64_t sam_pack_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1394,6 +1424,15 @@ UseGgmlGemm1:;
     }
 
     ggml_barrier(params->threadpool);
+
+    if (sam_capture) {
+        if (ith == 0) ggml_cpu_sam_observe(dst, "packing", "dot", vec_dot_type,
+            params->wdata, ggml_row_size(vec_dot_type, ggml_nelements(src1)), ggml_time_us() - sam_pack_start);
+        // Exclude the scratch-copy callback from the arithmetic interval.
+        ggml_barrier(params->threadpool);
+    }
+    const int64_t sam_arithmetic_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
     if (!params->use_ref && src1->type != vec_dot_type) {
@@ -1481,6 +1520,12 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+    if (sam_capture) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) ggml_cpu_sam_observe(dst, "arithmetic", "dot", vec_dot_type,
+            NULL, 0, ggml_time_us() - sam_arithmetic_start);
+    }
+
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -1778,6 +1823,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_add(params, tensor);
             } break;
+        case GGML_OP_FMA:
+            {
+                ggml_compute_forward_fma(params, tensor);
+            } break;
         case GGML_OP_ADD_ID:
             {
                 ggml_compute_forward_add_id(params, tensor);
@@ -1817,6 +1866,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_COS:
             {
                 ggml_compute_forward_cos(params, tensor);
+            } break;
+        case GGML_OP_POW_BASE_F32:
+            {
+                ggml_compute_forward_pow_base_f32(params, tensor);
+            } break;
+        case GGML_OP_MS_DEFORM_ATTN:
+            {
+                GGML_ABORT("MS_DEFORM_ATTN is CUDA-only");
             } break;
         case GGML_OP_SUM:
             {
@@ -1880,6 +1937,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
+                if (ggml_mul_mat_get_reduction_policy(tensor) != GGML_MUL_MAT_REDUCTION_DEFAULT) {
+                    GGML_ABORT("CPU MUL_MAT does not implement the requested reduction policy");
+                }
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
@@ -2273,6 +2333,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONT:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
+        case GGML_OP_FMA:
+        case GGML_OP_POW_BASE_F32:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
@@ -2322,6 +2384,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_HARDSWISH:
                 case GGML_UNARY_OP_HARDSIGMOID:
                 case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_LOG2:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_FLOOR:
@@ -2506,6 +2569,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_NONE:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_MS_DEFORM_ATTN:
+            {
+                GGML_ABORT("MS_DEFORM_ATTN is CUDA-only");
             } break;
         case GGML_OP_COUNT:
             {

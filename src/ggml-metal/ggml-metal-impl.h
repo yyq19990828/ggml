@@ -178,6 +178,7 @@
 #define OP_UNARY_NUM_ROUND       119
 #define OP_UNARY_NUM_TRUNC       120
 #define OP_UNARY_NUM_XIELU       121
+#define OP_UNARY_NUM_LOG2        122
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
@@ -1448,5 +1449,41 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+typedef struct {
+    int64_t  ne00;
+    int64_t  ne01;
+    int64_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int64_t  ne0;
+    int64_t  ne1;
+    int64_t  ne2;
+    int32_t  npx;
+    int32_t  npy;
+    int32_t  w;
+} ggml_metal_kargs_win_part;
+
+typedef struct {
+    int64_t  ne00;
+    int64_t  ne01;
+    int64_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int64_t  ne0;
+    int64_t  ne1;
+    int64_t  ne2;
+    int32_t  npx;
+    int32_t  w;
+} ggml_metal_kargs_win_unpart;
+
+typedef struct {
+    int64_t  ne[4];
+    int64_t  src_ne[12];
+    uint64_t src_nb[12];
+} ggml_metal_kargs_fma;
 
 #endif // GGML_METAL_IMPL

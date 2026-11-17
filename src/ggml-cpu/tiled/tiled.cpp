@@ -1054,6 +1054,9 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
+    const bool sam_capture = ggml_cpu_sam_observer_enabled() && src1->type == GGML_TYPE_F32;
+    const int64_t sam_pack_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
     if (src1->type != vec_dot_type) {
         char * wdata = (char *) params->wdata;
 
@@ -1085,6 +1088,14 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
     }
 
     ggml_barrier(params->threadpool);
+
+    if (sam_capture) {
+        if (ith == 0) ggml_cpu_sam_observe(dst, "packing", "tiled", vec_dot_type,
+            params->wdata, ggml_row_size(vec_dot_type, ggml_nelements(src1)), ggml_time_us() - sam_pack_start);
+        ggml_barrier(params->threadpool);
+    }
+    const int64_t sam_arithmetic_start = sam_capture && ith == 0 ? ggml_time_us() : 0;
+    if (sam_capture) ggml_barrier(params->threadpool);
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
@@ -1141,6 +1152,12 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
 
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
+    if (sam_capture) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) ggml_cpu_sam_observe(dst, "arithmetic", "tiled", vec_dot_type,
+            nullptr, 0, ggml_time_us() - sam_arithmetic_start);
+    }
+
 }
 
 // src0 type dispatch, shared by the MUL_MAT and MUL_MAT_ID entries: one expert for

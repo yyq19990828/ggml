@@ -12,6 +12,13 @@
 #include <cstdint>
 #include <utility>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+bool ggml_cuda_softmax_order_f32(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float scale, float max_bias);
+bool ggml_cuda_softmax_wide_order_f32(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float scale, float max_bias);
+#endif
+
 template <typename T>
 static __device__ __forceinline__ float t2f32(T val) {
     return (float) val;
@@ -407,6 +414,15 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_softmax_order_f32(ctx, dst, scale, max_bias)) {
+        return;
+    }
+    if (ggml_cuda_softmax_wide_order_f32(ctx, dst, scale, max_bias)) {
+        return;
+    }
+#endif
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 

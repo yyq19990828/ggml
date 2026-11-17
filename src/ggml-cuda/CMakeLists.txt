@@ -115,6 +115,9 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    if (NOT GGML_CUDA_CUDNN)
+        list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/cudnn.cu")
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -131,6 +134,11 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_CUDNN)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUDNN)
+        target_link_libraries(ggml-cuda PRIVATE CUDNN::cudnn)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -175,6 +183,10 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
     endif()
 
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8" AND NOT GGML_MUSA)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_BIAS_FUSION)
+    endif()
+
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
     else()
@@ -193,7 +205,10 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_CXX_FLAGS "")
 
-    set(CUDA_FLAGS -use_fast_math -extended-lambda)
+    # Keep the existing fast-math setting effective for every existing CUDA
+    # translation unit while allowing the persistent softmax TU to use its
+    # pinned non-fast-math arithmetic.
+    set(CUDA_FLAGS -extended-lambda)
 
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)
@@ -261,6 +276,41 @@ if (CUDAToolkit_FOUND)
     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
+
+    set(GGML_CUDA_FAST_MATH_SOURCES ${GGML_SOURCES_CUDA})
+    list(REMOVE_ITEM GGML_CUDA_FAST_MATH_SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/sam-precise.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/softmax-wide-order.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/log-f32-precise.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/ms-deform-attn.cu"
+         "${CMAKE_CURRENT_SOURCE_DIR}/sigmoid-f32-precise.cu")
+    set_source_files_properties(${GGML_CUDA_FAST_MATH_SOURCES}
+                                PROPERTIES COMPILE_OPTIONS "-use_fast_math")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/norm-affine.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/sam-precise.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/nonfast_sincos_f32.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-order.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/softmax-wide-order.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/pow-base-f32.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/log-f32-precise.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/sigmoid-f32-precise.cu"
+                                PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/group-norm-affine.cu"
+                            PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/ms-deform-attn.cu"
+                            PROPERTIES COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()

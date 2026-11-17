@@ -59,8 +59,16 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    int64_t                 ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
+
+    // If K is one, op(T) has only one B column, so its inter-column stride is
+    // unused. A transposed singleton view can tie its dimension strides and
+    // make ggml_is_transposed select op(T) with ldb < n; cuBLAS still requires
+    // ldb >= n even though that leading dimension is not read between columns.
+    if (src1_cublas_op == CUBLAS_OP_T && ne01 == 1 && ldb < ne1) {
+        ldb = ne1;
+    }
 
     // data strides in dimensions 2/3
     const size_t s02 = nb02 / sizeof(float);

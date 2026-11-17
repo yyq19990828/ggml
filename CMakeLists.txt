@@ -197,6 +197,7 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+option(GGML_CUDA_CUDNN                      "ggml: use cuDNN F32 Winograd convolution"         OFF)
 set   (GGML_CUDA_CCCL_VERSION "" CACHE STRING "ggml: CCCL git tag to fetch, empty to use the version bundled with the installed CUDA Toolkit")
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
@@ -282,10 +283,19 @@ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation" 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
+option(GGML_BUILD_POSITION_POWER_PROBE "ggml: build isolated scalar-base F32 power probe" OFF)
+option(GGML_BUILD_GROUP_NORM_AFFINE_PROBE "ggml: build isolated CUDA GroupNorm affine probe" OFF)
 
 #
 # dependencies
 #
+
+if (GGML_CUDA_CUDNN)
+    if (NOT GGML_CUDA OR GGML_HIP OR GGML_MUSA)
+        message(FATAL_ERROR "GGML_CUDA_CUDNN requires NVIDIA GGML_CUDA=ON and excludes HIP/MUSA")
+    endif()
+    find_package(CUDNN 9.10.2 EXACT REQUIRED MODULE)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED true)
@@ -304,6 +314,16 @@ include(GNUInstallDirs)
 #
 
 add_subdirectory(src)
+
+if (GGML_BUILD_POSITION_POWER_PROBE)
+    add_executable(ggml-position-power-probe tools/position_power/position_power_probe.cpp)
+    target_link_libraries(ggml-position-power-probe PRIVATE ggml)
+endif()
+
+if (GGML_BUILD_GROUP_NORM_AFFINE_PROBE)
+    add_executable(ggml-group-norm-affine-probe tools/group_norm_affine/group_norm_affine_probe.cpp)
+    target_link_libraries(ggml-group-norm-affine-probe PRIVATE ggml)
+endif()
 
 #
 # tests and examples
@@ -327,6 +347,8 @@ include(CMakePackageConfigHelpers)
 # all public headers
 set(GGML_PUBLIC_HEADERS
     include/ggml.h
+    include/ggml-ms-deform-attn.h
+    include/ggml-mul-mat-reduction.h
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
@@ -414,6 +436,10 @@ message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/ggml-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
+if (GGML_CUDA_CUDNN)
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindCUDNN.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
+endif()
 
 if (MSVC)
     set(MSVC_WARNING_FLAGS
